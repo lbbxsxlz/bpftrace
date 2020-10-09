@@ -41,6 +41,11 @@ void SemanticAnalyser::visit(Integer &integer)
 void SemanticAnalyser::visit(PositionalParameter &param)
 {
   param.type = CreateInt64();
+  if (func_ == "str")
+  {
+    param.is_in_str = true;
+    has_pos_param_ = true;
+  }
   switch (param.ptype)
   {
     case PositionalParameterType::positional:
@@ -54,14 +59,6 @@ void SemanticAnalyser::visit(PositionalParameter &param)
           LOG(ERROR, param.loc, err_)
               << "$" << param.n << " used numerically but given \"" << pstr
               << "\". Try using str($" << param.n << ").";
-        }
-        if (is_numeric(pstr) && param.is_in_str)
-        {
-          // This is blocked due to current limitations in our codegen
-          LOG(ERROR, param.loc, err_)
-              << "$" << param.n
-              << " used in str(), but given numeric value: " << pstr
-              << ". Try $" << param.n << " instead of str($" << param.n << ").";
         }
       }
       break;
@@ -527,7 +524,8 @@ void SemanticAnalyser::visit(Call &call)
   }
   else if (call.func == "str") {
     if (check_varargs(call, 1, 2)) {
-      auto &t = call.vargs->at(0)->type;
+      auto *arg = call.vargs->at(0);
+      auto &t = arg->type;
       if (!t.IsIntegerTy() && !t.IsPtrTy())
       {
         LOG(ERROR, call.loc, err_)
@@ -535,13 +533,29 @@ void SemanticAnalyser::visit(Call &call)
             << "argument (" << t << " provided)";
       }
       call.type = CreateString(bpftrace_.strlen_);
+      if (has_pos_param_)
+      {
+        if (dynamic_cast<PositionalParameter *>(arg))
+          call.is_literal = true;
+        else
+        {
+          auto binop = dynamic_cast<Binop *>(arg);
+          if (!(binop && (dynamic_cast<PositionalParameter *>(binop->left) ||
+                          dynamic_cast<PositionalParameter *>(binop->right))))
+          {
+            // Only str($1), str($1 + CONST), or str(CONST + $1) are allowed
+            LOG(ERROR, call.loc, err_)
+                << call.func << "() only accepts positional parameters"
+                << " directly or with a single constant offset added";
+          }
+        }
+      }
+
       if (is_final_pass() && call.vargs->size() > 1) {
         check_arg(call, Type::integer, 1, false);
       }
-      if (auto *param = dynamic_cast<PositionalParameter*>(call.vargs->at(0))) {
-        param->is_in_str = true;
-      }
     }
+    has_pos_param_ = false;
   }
   else if (call.func == "buf")
   {
@@ -591,11 +605,6 @@ void SemanticAnalyser::visit(Call &call)
 
     buffer_size++; // extra byte is used to embed the length of the buffer
     call.type = CreateBuffer(buffer_size);
-
-    if (auto *param = dynamic_cast<PositionalParameter *>(call.vargs->at(0)))
-    {
-      param->is_in_str = true;
-    }
   }
   else if (call.func == "ksym" || call.func == "usym") {
     if (check_nargs(call, 1)) {
@@ -667,9 +676,8 @@ void SemanticAnalyser::visit(Call &call)
     {
       if (check_arg(call, Type::string, 1, true))
       {
-        auto &join_delim_arg = *call.vargs->at(1);
-        String &join_delim_str = static_cast<String &>(join_delim_arg);
-        bpftrace_.join_args_.push_back(join_delim_str.str);
+        auto join_delim_str = bpftrace_.get_string_literal(call.vargs->at(1));
+        bpftrace_.join_args_.push_back(join_delim_str);
       }
     }
     else
@@ -690,8 +698,7 @@ void SemanticAnalyser::visit(Call &call)
       }
 
       if (check_arg(call, Type::string, 0, true)) {
-        auto &arg = *call.vargs->at(0);
-        auto &reg_name = static_cast<String&>(arg).str;
+        auto reg_name = bpftrace_.get_string_literal(call.vargs->at(0));
         int offset = arch::offset(reg_name);;
         if (offset == -1) {
           LOG(ERROR, call.loc, err_)
@@ -718,7 +725,7 @@ void SemanticAnalyser::visit(Call &call)
       return;
 
     std::vector<int> sizes;
-    auto &name = static_cast<String &>(*call.vargs->at(0)).str;
+    auto name = bpftrace_.get_string_literal(call.vargs->at(0));
     for (auto &ap : *probe_->attach_points)
     {
       ProbeType type = probetype(ap->provider);
@@ -966,7 +973,7 @@ void SemanticAnalyser::visit(Call &call)
     auto &arg = *call.vargs->at(0);
     if (arg.type.IsStringTy() && arg.is_literal)
     {
-      auto sig = static_cast<String&>(arg).str;
+      auto sig = bpftrace_.get_string_literal(&arg);
       if (signal_name_to_num(sig) < 1) {
         LOG(ERROR, call.loc, err_) << sig << " is not a valid signal";
       }
@@ -1045,7 +1052,19 @@ void SemanticAnalyser::visit(Call &call)
       }
     }
   }
-  else {
+  else if (call.func == "kptr" || call.func == "uptr")
+  {
+    if (!check_nargs(call, 1))
+      return;
+    if (!check_arg(call, Type::pointer, 0))
+      return;
+
+    auto as = (call.func == "kptr" ? AddrSpace::kernel : AddrSpace::user);
+    call.type = call.vargs->front()->type;
+    call.type.SetAS(as);
+  }
+  else
+  {
     LOG(ERROR, call.loc, err_) << "Unknown function: '" << call.func << "'";
     call.type = CreateNone();
   }
@@ -1054,53 +1073,65 @@ void SemanticAnalyser::visit(Call &call)
 void SemanticAnalyser::check_stack_call(Call &call, bool kernel)
 {
   call.type = CreateStack(kernel);
-  if (check_varargs(call, 0, 2) && is_final_pass()) {
-    StackType stack_type;
-    if (call.vargs) {
-      switch (call.vargs->size()) {
-        case 0: break;
-        case 1: {
-          auto &arg = *call.vargs->at(0);
-          // If we have a single argument it can be either
-          // stack-mode or stack-size
-          if (arg.type.IsStackModeTy())
-          {
-            if (check_arg(call, Type::stack_mode, 0, true))
-              stack_type.mode = static_cast<StackMode&>(arg).type.stack_type.mode;
-          }
-          else
-          {
-            if (check_arg(call, Type::integer, 0, true))
-              stack_type.limit = static_cast<Integer&>(arg).n;
-          }
-          break;
-        }
-        case 2: {
-          if (check_arg(call, Type::stack_mode, 0, true)) {
-            auto &mode_arg = *call.vargs->at(0);
-            stack_type.mode = static_cast<StackMode&>(mode_arg).type.stack_type.mode;
-          }
-
-          if (check_arg(call, Type::integer, 1, true)) {
-            auto &limit_arg = *call.vargs->at(1);
-            stack_type.limit = static_cast<Integer&>(limit_arg).n;
-          }
-          break;
-        }
-        default:
-          LOG(ERROR, call.loc, err_) << "Invalid number of arguments";
-          break;
-      }
-    }
-    if (stack_type.limit > MAX_STACK_SIZE)
-    {
-      LOG(ERROR, call.loc, err_)
-          << call.func << "([int limit]): limit shouldn't exceed "
-          << MAX_STACK_SIZE << ", " << stack_type.limit << " given";
-    }
-    call.type = CreateStack(kernel, stack_type);
-    needs_stackid_maps_.insert(stack_type);
+  if (!check_varargs(call, 0, 2))
+  {
+    return;
   }
+
+  StackType stack_type;
+  if (call.vargs)
+  {
+    switch (call.vargs->size())
+    {
+      case 0:
+        break;
+      case 1:
+      {
+        auto &arg = *call.vargs->at(0);
+        // If we have a single argument it can be either
+        // stack-mode or stack-size
+        if (arg.type.IsStackModeTy())
+        {
+          if (check_arg(call, Type::stack_mode, 0, true))
+            stack_type.mode =
+                static_cast<StackMode &>(arg).type.stack_type.mode;
+        }
+        else
+        {
+          if (check_arg(call, Type::integer, 0, true))
+            stack_type.limit = static_cast<Integer &>(arg).n;
+        }
+        break;
+      }
+      case 2:
+      {
+        if (check_arg(call, Type::stack_mode, 0, true))
+        {
+          auto &mode_arg = *call.vargs->at(0);
+          stack_type.mode =
+              static_cast<StackMode &>(mode_arg).type.stack_type.mode;
+        }
+
+        if (check_arg(call, Type::integer, 1, true))
+        {
+          auto &limit_arg = *call.vargs->at(1);
+          stack_type.limit = static_cast<Integer &>(limit_arg).n;
+        }
+        break;
+      }
+      default:
+        LOG(ERROR, call.loc, err_) << "Invalid number of arguments";
+        break;
+    }
+  }
+  if (stack_type.limit > MAX_STACK_SIZE)
+  {
+    LOG(ERROR, call.loc, err_)
+        << call.func << "([int limit]): limit shouldn't exceed "
+        << MAX_STACK_SIZE << ", " << stack_type.limit << " given";
+  }
+  call.type = CreateStack(kernel, stack_type);
+  needs_stackid_maps_.insert(stack_type);
 }
 
 void SemanticAnalyser::visit(Map &map)
@@ -1323,6 +1354,32 @@ void SemanticAnalyser::visit(Binop &binop)
               << "signed operands for '" << opstr(binop)
               << "' can lead to undefined behavior "
               << "(cast to unsigned to silence warning)";
+        }
+      }
+
+      if (func_ == "str")
+      {
+        // Check if one of the operands is a positional parameter
+        // The other one should be a constant offset
+        auto pos_param = dynamic_cast<PositionalParameter *>(left);
+        auto offset = dynamic_cast<Integer *>(right);
+        if (!pos_param)
+        {
+          pos_param = dynamic_cast<PositionalParameter *>(right);
+          offset = dynamic_cast<Integer *>(left);
+        }
+
+        if (pos_param)
+        {
+          auto len = bpftrace_.get_param(pos_param->n, true).length();
+          if (!offset || binop.op != bpftrace::Parser::token::PLUS ||
+              offset->n < 0 || (size_t)offset->n > len)
+          {
+            LOG(ERROR, binop.loc + binop.right->loc, err_)
+                << "only addition of a single constant less or equal to the "
+                << "length of $" << pos_param->n << " (which is " << len << ")"
+                << " is allowed inside str()";
+          }
         }
       }
     }
@@ -1587,17 +1644,17 @@ void SemanticAnalyser::visit(FieldAccess &acc)
       return;
     }
 
-    bool valid_idx = static_cast<size_t>(acc.index) < type.tuple_elems.size();
+    bool valid_idx = static_cast<size_t>(acc.index) < type.GetFields().size();
 
     // We may not have inferred the full type of the tuple yet in early passes
     // so wait until the final pass.
     if (!valid_idx && is_final_pass())
       LOG(ERROR, acc.loc, err_)
           << "Invalid tuple index: " << acc.index << ". Found "
-          << type.tuple_elems.size() << " elements in tuple.";
+          << type.GetFields().size() << " elements in tuple.";
 
     if (valid_idx)
-      acc.type = type.tuple_elems[acc.index];
+      acc.type = type.GetField(acc.index).type;
 
     return;
   }
@@ -1716,22 +1773,16 @@ void SemanticAnalyser::visit(Cast &cast)
 
 void SemanticAnalyser::visit(Tuple &tuple)
 {
-  auto &type = tuple.type;
-  size_t total_size = 0;
-
-  type.tuple_elems.clear();
-
+  std::vector<SizedType> elements;
   for (size_t i = 0; i < tuple.elems->size(); ++i)
   {
     Expression *elem = tuple.elems->at(i);
     elem->accept(*this);
 
-    type.tuple_elems.emplace_back(elem->type);
-    total_size += elem->type.size;
+    elements.emplace_back(elem->type);
   }
 
-  type.type = Type::tuple;
-  type.size = total_size;
+  tuple.type = CreateTuple(elements);
 }
 
 void SemanticAnalyser::visit(ExprStatement &expr)
@@ -1991,6 +2042,7 @@ void SemanticAnalyser::visit(AttachPoint &ap)
     default:
       // If we are doing a PATH lookup (ie not glob), we follow shell
       // behavior and take the first match.
+      // Otherwise we keep the target with glob, it will be expanded later
       if (ap.target.find("*") == std::string::npos)
       {
         LOG(WARNING, ap.loc, out_)
@@ -1998,11 +2050,6 @@ void SemanticAnalyser::visit(AttachPoint &ap)
             << "' but matched " << std::to_string(paths.size()) << " binaries";
         ap.target = paths.front();
       }
-      else
-        LOG(ERROR, ap.loc, err_)
-            << "uprobe target file '" << ap.target
-            << "' must refer to a unique binary but matched "
-            << std::to_string(paths.size());
     }
   }
   else if (ap.provider == "usdt") {
@@ -2025,6 +2072,7 @@ void SemanticAnalyser::visit(AttachPoint &ap)
       default:
         // If we are doing a PATH lookup (ie not glob), we follow shell
         // behavior and take the first match.
+        // Otherwise we keep the target with glob, it will be expanded later
         if (ap.target.find("*") == std::string::npos)
         {
           LOG(WARNING, ap.loc, out_)
@@ -2033,11 +2081,6 @@ void SemanticAnalyser::visit(AttachPoint &ap)
               << " binaries";
           ap.target = paths.front();
         }
-        else
-          LOG(ERROR, ap.loc, err_)
-              << "usdt target file '" << ap.target
-              << "' must refer to a unique binary but matched "
-              << std::to_string(paths.size());
       }
     }
 
@@ -2047,7 +2090,8 @@ void SemanticAnalyser::visit(AttachPoint &ap)
     }
     else if (ap.target != "")
     {
-      USDTHelper::probes_for_path(ap.target);
+      for (auto &path : resolve_binary_path(ap.target))
+        USDTHelper::probes_for_path(path);
     }
     else
     {
@@ -2246,6 +2290,19 @@ int SemanticAnalyser::analyse()
 
 int SemanticAnalyser::create_maps(bool debug)
 {
+  // Doing `semantic.create_maps<bpftrace::Map>` in main()
+  // wouldn't work as the template needs to be instantiated
+  // in the source file (or header). This exists to work
+  // around that
+  if (debug)
+    return create_maps_impl<bpftrace::FakeMap>();
+  else
+    return create_maps_impl<bpftrace::Map>();
+}
+
+template <typename T>
+int SemanticAnalyser::create_maps_impl(void)
+{
   uint32_t failed_maps = 0;
   auto is_invalid_map = [](int a) -> uint8_t { return a < 0 ? 1 : 0; };
   for (auto &map_val : map_val_)
@@ -2262,108 +2319,69 @@ int SemanticAnalyser::create_maps(bool debug)
 
     auto &key = search_args->second;
 
-    if (debug)
+    if (type.IsLhistTy())
     {
-      bpftrace_.maps_[map_name] = std::make_unique<bpftrace::FakeMap>(map_name, type, key);
-      bpftrace_.maps_[map_name]->id = bpftrace_.map_ids_.size();
-      bpftrace_.map_ids_.push_back(map_name);
+      auto map_args = map_args_.find(map_name);
+      if (map_args == map_args_.end())
+      {
+        out_ << "map arg \"" << map_name << "\" not found" << std::endl;
+        abort();
+      }
+
+      Expression &min_arg = *map_args->second.at(1);
+      Expression &max_arg = *map_args->second.at(2);
+      Expression &step_arg = *map_args->second.at(3);
+      Integer &min = static_cast<Integer &>(min_arg);
+      Integer &max = static_cast<Integer &>(max_arg);
+      Integer &step = static_cast<Integer &>(step_arg);
+      auto map = std::make_unique<T>(
+          map_name, type, key, min.n, max.n, step.n, bpftrace_.mapmax_);
+      failed_maps += is_invalid_map(map->mapfd_);
+      bpftrace_.maps.Add(std::move(map));
     }
     else
     {
-      if (type.IsLhistTy())
-      {
-        // store lhist args to the bpftrace::Map
-        auto map_args = map_args_.find(map_name);
-        if (map_args == map_args_.end())
-        {
-          out_ << "map arg \"" << map_name << "\" not found" << std::endl;
-          abort();
-        }
-
-        Expression &min_arg = *map_args->second.at(1);
-        Expression &max_arg = *map_args->second.at(2);
-        Expression &step_arg = *map_args->second.at(3);
-        Integer &min = static_cast<Integer&>(min_arg);
-        Integer &max = static_cast<Integer&>(max_arg);
-        Integer &step = static_cast<Integer&>(step_arg);
-        bpftrace_.maps_[map_name] = std::make_unique<bpftrace::Map>(
-            map_name, type, key, min.n, max.n, step.n, bpftrace_.mapmax_);
-        bpftrace_.maps_[map_name]->id = bpftrace_.map_ids_.size();
-        bpftrace_.map_ids_.push_back(map_name);
-        failed_maps += is_invalid_map(bpftrace_.maps_[map_name]->mapfd_);
-      }
-      else
-      {
-        bpftrace_.maps_[map_name] = std::make_unique<bpftrace::Map>(
-            map_name, type, key, bpftrace_.mapmax_);
-        bpftrace_.maps_[map_name]->id = bpftrace_.map_ids_.size();
-        bpftrace_.map_ids_.push_back(map_name);
-        failed_maps += is_invalid_map(bpftrace_.maps_[map_name]->mapfd_);
-      }
+      auto map = std::make_unique<T>(map_name, type, key, bpftrace_.mapmax_);
+      failed_maps += is_invalid_map(map->mapfd_);
+      bpftrace_.maps.Add(std::move(map));
     }
   }
 
   for (StackType stack_type : needs_stackid_maps_) {
     // The stack type doesn't matter here, so we use kstack to force SizedType
     // to set stack_size.
-    if (debug)
-    {
-      bpftrace_.stackid_maps_[stack_type] = std::make_unique<bpftrace::FakeMap>(
-          CreateStack(true, stack_type));
-    }
-    else
-    {
-      bpftrace_.stackid_maps_[stack_type] = std::make_unique<bpftrace::Map>(
-          CreateStack(true, stack_type));
-      failed_maps += is_invalid_map(bpftrace_.stackid_maps_[stack_type]->mapfd_);
-    }
+
+    auto map = std::make_unique<T>(CreateStack(true, stack_type));
+    failed_maps += is_invalid_map(map->mapfd_);
+    bpftrace_.maps.Set(stack_type, std::move(map));
   }
 
-  if (debug)
+  if (needs_join_map_)
   {
-    if (needs_join_map_)
-    {
-      // join uses map storage as we'd like to process data larger than can fit on the BPF stack.
-      std::string map_ident = "join";
-      SizedType type = CreateJoin(bpftrace_.join_argnum_,
-                                  bpftrace_.join_argsize_);
-      MapKey key;
-      bpftrace_.join_map_ = std::make_unique<bpftrace::FakeMap>(map_ident, type, key);
-    }
-    if (needs_elapsed_map_)
-    {
-      std::string map_ident = "elapsed";
-      SizedType type = CreateUInt64();
-      MapKey key;
-      bpftrace_.elapsed_map_ =
-          std::make_unique<bpftrace::FakeMap>(map_ident, type, key);
-    }
-
-    bpftrace_.perf_event_map_ = std::make_unique<bpftrace::FakeMap>(BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    // join uses map storage as we'd like to process data larger than can fit on
+    // the BPF stack.
+    std::string map_ident = "join";
+    SizedType type = CreateJoin(bpftrace_.join_argnum_,
+                                bpftrace_.join_argsize_);
+    MapKey key;
+    auto map = std::make_unique<T>(map_ident, type, key, 1);
+    failed_maps += is_invalid_map(map->mapfd_);
+    bpftrace_.maps.Set(MapManager::Type::Join, std::move(map));
   }
-  else
+  if (needs_elapsed_map_)
   {
-    if (needs_join_map_)
-    {
-      // join uses map storage as we'd like to process data larger than can fit on the BPF stack.
-      std::string map_ident = "join";
-      SizedType type = CreateJoin(bpftrace_.join_argnum_,
-                                  bpftrace_.join_argsize_);
-      MapKey key;
-      bpftrace_.join_map_ = std::make_unique<bpftrace::Map>(map_ident, type, key, 1);
-      failed_maps += is_invalid_map(bpftrace_.join_map_->mapfd_);
-    }
-    if (needs_elapsed_map_)
-    {
-      std::string map_ident = "elapsed";
-      SizedType type = CreateUInt64();
-      MapKey key;
-      bpftrace_.elapsed_map_ =
-          std::make_unique<bpftrace::Map>(map_ident, type, key, 1);
-      failed_maps += is_invalid_map(bpftrace_.elapsed_map_->mapfd_);
-    }
-    bpftrace_.perf_event_map_ = std::make_unique<bpftrace::Map>(BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    failed_maps += is_invalid_map(bpftrace_.perf_event_map_->mapfd_);
+    std::string map_ident = "elapsed";
+    SizedType type = CreateUInt64();
+    MapKey key;
+    auto map = std::make_unique<T>(map_ident, type, key, 1);
+    failed_maps += is_invalid_map(map->mapfd_);
+    bpftrace_.maps.Set(MapManager::Type::Elapsed, std::move(map));
+  }
+
+  {
+    auto map = std::make_unique<T>(BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    failed_maps += is_invalid_map(map->mapfd_);
+    bpftrace_.maps.Set(MapManager::Type::PerfEvent, std::move(map));
   }
 
   if (failed_maps > 0)
@@ -2532,6 +2550,15 @@ bool SemanticAnalyser::check_arg(const Call &call, Type type, int arg_num, bool 
   {
     LOG(ERROR, call.loc, err_) << call.func << "() expects a " << type
                                << " literal (" << arg.type.type << " provided)";
+    if (type == Type::string)
+    {
+      // If the call requires a string literal and a positional parameter is
+      // given, tell user to use str()
+      auto *pos_param = dynamic_cast<PositionalParameter *>(&arg);
+      if (pos_param)
+        LOG(ERROR) << "Use str($" << pos_param->n << ") to treat $"
+                   << pos_param->n << " as a string";
+    }
     return false;
   }
   else if (is_final_pass() && arg.type.type != type) {
@@ -2548,7 +2575,7 @@ bool SemanticAnalyser::check_symbol(const Call &call, int arg_num __attribute__(
   if (!call.vargs)
     return false;
 
-  auto &arg = static_cast<String&>(*call.vargs->at(0)).str;
+  auto arg = bpftrace_.get_string_literal(call.vargs->at(0));
 
   std::string re = "^[a-zA-Z0-9./_-]+$";
   bool is_valid = std::regex_match(arg, std::regex(re));

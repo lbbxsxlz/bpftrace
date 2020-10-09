@@ -14,7 +14,8 @@
 #include "bpffeature.h"
 #include "btf.h"
 #include "child.h"
-#include "imap.h"
+#include "map.h"
+#include "mapmanager.h"
 #include "output.h"
 #include "printf.h"
 #include "procmon.h"
@@ -101,10 +102,6 @@ public:
   inline int next_probe_id() {
     return next_probe_id_++;
   };
-  inline IMap &get_map_by_id(uint32_t id)
-  {
-    return *maps_[map_ids_[id]].get();
-  };
   std::string get_stack(uint64_t stackidpid, bool ustack, StackType stack_type, int indent=0);
   std::string resolve_buf(char *buf, size_t size);
   std::string resolve_ksym(uintptr_t addr, bool show_offset=false);
@@ -129,17 +126,14 @@ public:
   size_t num_params() const;
   void request_finalize();
   bool is_aslr_enabled(int pid);
+  std::string get_string_literal(const ast::Expression *expr) const;
 
   std::string cmd_;
   bool finalize_ = false;
   // Global variable checking if an exit signal was received
   static volatile sig_atomic_t exitsig_recv;
 
-  std::map<std::string, std::unique_ptr<IMap>> maps_;
-
-  // Maps a map id back to the map identifier. See get_map_by_id()
-  std::vector<std::string> map_ids_;
-
+  MapManager maps;
   std::map<std::string, Struct> structs_;
   std::map<std::string, std::string> macros_;
   std::map<std::string, uint64_t> enums_;
@@ -151,10 +145,7 @@ public:
   std::vector<std::tuple<std::string, std::vector<Field>>> cat_args_;
   std::vector<SizedType> non_map_print_args_;
   std::unordered_map<int64_t, struct HelperErrorInfo> helper_error_info_;
-  std::unordered_map<StackType, std::unique_ptr<IMap>> stackid_maps_;
-  std::unique_ptr<IMap> join_map_;
-  std::unique_ptr<IMap> elapsed_map_;
-  std::unique_ptr<IMap> perf_event_map_;
+
   std::vector<std::string> probe_ids_;
   unsigned int join_argnum_;
   unsigned int join_argsize_;
@@ -171,7 +162,6 @@ public:
   bool resolve_user_symbols_ = true;
   bool cache_user_symbols_ = true;
   bool safe_mode_ = true;
-  bool force_btf_ = false;
   bool has_usdt_ = false;
   bool usdt_file_activation_ = false;
   int helper_check_level_ = 0;
@@ -216,6 +206,8 @@ private:
   int online_cpus_;
   std::vector<std::string> params_;
   int next_probe_id_ = 0;
+
+  std::vector<std::unique_ptr<void, void (*)(void *)>> open_perf_buffers_;
 
   std::vector<std::unique_ptr<AttachedProbe>> attach_usdt_probe(
       Probe &probe,

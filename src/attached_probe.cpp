@@ -3,12 +3,10 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
-#include <link.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/limits.h>
 #include <linux/perf_event.h>
 #include <regex>
-#include <sys/auxv.h>
 #include <sys/utsname.h>
 #include <tuple>
 #include <unistd.h>
@@ -23,7 +21,6 @@
 #include <bcc/bcc_syms.h>
 #include <bcc/bcc_usdt.h>
 #include <linux/perf_event.h>
-#include <linux/version.h>
 
 namespace libbpf {
 #undef __BPF_FUNC_MAPPER
@@ -78,10 +75,11 @@ bpf_prog_type progtype(ProbeType t)
     case ProbeType::kretfunc:
       return static_cast<enum ::bpf_prog_type>(libbpf::BPF_PROG_TYPE_TRACING);
       break;
-    default:
-      LOG(FATAL) << "program type not found";
+    case ProbeType::invalid:
+      LOG(FATAL) << "program type invalid";
   }
-  // lgtm[cpp/missing-return]
+
+  return {}; // unreached
 }
 
 std::string progtypeName(bpf_prog_type t)
@@ -234,7 +232,7 @@ AttachedProbe::~AttachedProbe()
     case ProbeType::watchpoint:
     case ProbeType::hardware:
       break;
-    default:
+    case ProbeType::invalid:
       LOG(FATAL) << "invalid attached probe type \""
                  << probetypeName(probe_.type) << "\" at destructor";
   }
@@ -253,10 +251,9 @@ std::string AttachedProbe::eventprefix() const
       return "p_";
     case BPF_PROBE_RETURN:
       return "r_";
-    default:
-      LOG(FATAL) << "invalid eventprefix";
   }
-  // lgtm[cpp/missing-return]
+
+  return {}; // unreached
 }
 
 std::string AttachedProbe::eventname() const
@@ -331,6 +328,11 @@ resolve_offset(const std::string &path, const std::string &symbol, uint64_t loc)
   if (bcc_resolve_symname(path.c_str(), symbol.c_str(), loc, 0, nullptr, &bcc_sym))
      throw std::runtime_error("Could not resolve symbol: " + path + ":" + symbol);
 
+  // Have to free sym.module, see:
+  // https://github.com/iovisor/bcc/blob/ba73657cb8c4dab83dfb89eed4a8b3866255569a/src/cc/bcc_syms.h#L98-L99
+  if (bcc_sym.module)
+    ::free(const_cast<char *>(bcc_sym.module));
+
   return bcc_sym.offset;
 }
 
@@ -347,17 +349,16 @@ static void check_alignment(std::string &path,
 
   std::string tmp = path + ":" + symbol + "+" + std::to_string(func_offset);
 
-  if (AlignState::Ok == aligned)
-    return;
-
-    // If we did not allow unaligned uprobes in the
-    // compile time, force the safe mode now.
+  // If we did not allow unaligned uprobes in the
+  // compile time, force the safe mode now.
 #ifndef HAVE_UNSAFE_PROBE
   safe_mode = true;
 #endif
 
   switch (aligned)
   {
+    case AlignState::Ok:
+      return;
     case AlignState::NotAlign:
       if (safe_mode)
         throw std::runtime_error("Could not add " + probe_name +
@@ -385,9 +386,6 @@ static void check_alignment(std::string &path,
       else
         LOG(WARNING) << "Unchecked " + probe_name + " : " << tmp;
       break;
-
-    default:
-      throw std::runtime_error("Internal error: " + tmp);
   }
 }
 
@@ -512,7 +510,7 @@ void AttachedProbe::resolve_offset_kprobe(bool safe_mode)
   sym.name = symbol;
   const struct vmlinux_location *locs = vmlinux_locs;
   struct vmlinux_location locs_env[] = {
-    { nullptr, true },
+    { nullptr, false },
     { nullptr, false },
   };
   char *env_path = std::getenv("BPFTRACE_VMLINUX");
@@ -556,96 +554,6 @@ void AttachedProbe::resolve_offset_kprobe(bool safe_mode)
 
   check_alignment(
       path, symbol, sym_offset, func_offset, safe_mode, probe_.type);
-}
-
-/**
- * Search for LINUX_VERSION_CODE in the vDSO, returning 0 if it can't be found.
- */
-static unsigned _find_version_note(unsigned long base)
-{
-  auto ehdr = reinterpret_cast<const ElfW(Ehdr) *>(base);
-
-  for (int i = 0; i < ehdr->e_shnum; i++)
-  {
-    auto shdr = reinterpret_cast<const ElfW(Shdr) *>(
-      base + ehdr->e_shoff + (i * ehdr->e_shentsize)
-    );
-
-    if (shdr->sh_type == SHT_NOTE)
-    {
-      auto ptr = reinterpret_cast<const char *>(base + shdr->sh_offset);
-      auto end = ptr + shdr->sh_size;
-
-      while (ptr < end)
-      {
-        auto nhdr = reinterpret_cast<const ElfW(Nhdr) *>(ptr);
-        ptr += sizeof *nhdr;
-
-        auto name = ptr;
-        ptr += (nhdr->n_namesz + sizeof(ElfW(Word)) - 1) & -sizeof(ElfW(Word));
-
-        auto desc = ptr;
-        ptr += (nhdr->n_descsz + sizeof(ElfW(Word)) - 1) & -sizeof(ElfW(Word));
-
-        if ((nhdr->n_namesz > 5 && !memcmp(name, "Linux", 5)) &&
-            nhdr->n_descsz == 4 && !nhdr->n_type)
-          return *reinterpret_cast<const uint32_t *>(desc);
-      }
-    }
-  }
-
-  return 0;
-}
-
-/**
- * Find a LINUX_VERSION_CODE matching the host kernel. The build-time constant
- * may not match if bpftrace is compiled on a different Linux version than it's
- * used on, e.g. if built with Docker.
- */
-static unsigned kernel_version(int attempt)
-{
-  switch (attempt)
-  {
-    case 0:
-    {
-      // Fetch LINUX_VERSION_CODE from the vDSO .note section, falling back on
-      // the build-time constant if unavailable. This always matches the
-      // running kernel, but is not supported on arm32.
-      unsigned code = 0;
-      unsigned long base = getauxval(AT_SYSINFO_EHDR);
-      if (base && !memcmp(reinterpret_cast<void *>(base), ELFMAG, 4))
-        code = _find_version_note(base);
-      if (! code)
-        code = LINUX_VERSION_CODE;
-      return code;
-    }
-    case 1:
-      struct utsname utsname;
-      if (uname(&utsname) < 0)
-        return 0;
-      unsigned x, y, z;
-      if (sscanf(utsname.release, "%u.%u.%u", &x, &y, &z) != 3)
-        return 0;
-      return KERNEL_VERSION(x, y, z);
-    case 2:
-    {
-      // Try to get the definition of LINUX_VERSION_CODE at runtime.
-      std::ifstream linux_version_header{"/usr/include/linux/version.h"};
-      const std::string content{std::istreambuf_iterator<char>(linux_version_header),
-                                std::istreambuf_iterator<char>()};
-      const std::regex regex{"#define\\s+LINUX_VERSION_CODE\\s+(\\d+)"};
-      std::smatch match;
-
-      if (std::regex_search(content.begin(), content.end(), match, regex))
-        return static_cast<unsigned>(std::stoi(match[1]));
-
-      return 0;
-    }
-    default:
-      break;
-  }
-  LOG(FATAL) << "invalid kernel version";
-  // lgtm[cpp/missing-return]
 }
 
 void AttachedProbe::load_prog()

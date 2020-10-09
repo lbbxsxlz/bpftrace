@@ -589,6 +589,15 @@ TEST(semantic_analyser, call_str_2_expr)
   test("kprobe:f { @x = str(arg0, arg1); }", 0);
 }
 
+TEST(semantic_analyser, call_str_state_leak_regression_test)
+{
+  // Previously, the semantic analyser would leak state in the first str()
+  // call. This would make the semantic analyser think it's still processing
+  // a positional parameter in the second str() call causing confusing error
+  // messages.
+  test(R"PROG(kprobe:f { $x = str($1) == "asdf"; $y = str(arg0) })PROG", 0);
+}
+
 TEST(semantic_analyser, call_buf)
 {
   test("kprobe:f { buf(arg0, 1); }", 0);
@@ -767,28 +776,28 @@ TEST(semantic_analyser, call_stack)
   test("kprobe:f { ustack(perf, 3) }", 0);
 
   // Wrong arguments
-  test("kprobe:f { kstack(3, perf) }", 10);
-  test("kprobe:f { ustack(3, perf) }", 10);
+  test("kprobe:f { kstack(3, perf) }", 1);
+  test("kprobe:f { ustack(3, perf) }", 1);
   test("kprobe:f { kstack(perf, 3, 4) }", 1);
   test("kprobe:f { ustack(perf, 3, 4) }", 1);
   test("kprobe:f { kstack(bob) }", 1);
   test("kprobe:f { ustack(bob) }", 1);
-  test("kprobe:f { kstack(\"str\") }", 10);
-  test("kprobe:f { ustack(\"str\") }", 10);
-  test("kprobe:f { kstack(perf, \"str\") }", 10);
-  test("kprobe:f { ustack(perf, \"str\") }", 10);
-  test("kprobe:f { kstack(\"str\", 3) }", 10);
-  test("kprobe:f { ustack(\"str\", 3) }", 10);
+  test("kprobe:f { kstack(\"str\") }", 1);
+  test("kprobe:f { ustack(\"str\") }", 1);
+  test("kprobe:f { kstack(perf, \"str\") }", 1);
+  test("kprobe:f { ustack(perf, \"str\") }", 1);
+  test("kprobe:f { kstack(\"str\", 3) }", 1);
+  test("kprobe:f { ustack(\"str\", 3) }", 1);
 
   // Non-literals
-  test("kprobe:f { @x = perf; kstack(@x) }", 10);
-  test("kprobe:f { @x = perf; ustack(@x) }", 10);
-  test("kprobe:f { @x = perf; kstack(@x, 3) }", 10);
-  test("kprobe:f { @x = perf; ustack(@x, 3) }", 10);
-  test("kprobe:f { @x = 3; kstack(@x) }", 10);
-  test("kprobe:f { @x = 3; ustack(@x) }", 10);
-  test("kprobe:f { @x = 3; kstack(perf, @x) }", 10);
-  test("kprobe:f { @x = 3; ustack(perf, @x) }", 10);
+  test("kprobe:f { @x = perf; kstack(@x) }", 1);
+  test("kprobe:f { @x = perf; ustack(@x) }", 1);
+  test("kprobe:f { @x = perf; kstack(@x, 3) }", 1);
+  test("kprobe:f { @x = perf; ustack(@x, 3) }", 1);
+  test("kprobe:f { @x = 3; kstack(@x) }", 1);
+  test("kprobe:f { @x = 3; ustack(@x) }", 1);
+  test("kprobe:f { @x = 3; kstack(perf, @x) }", 1);
+  test("kprobe:f { @x = 3; ustack(perf, @x) }", 1);
 }
 
 TEST(semantic_analyser, map_reassignment)
@@ -1204,7 +1213,6 @@ TEST(semantic_analyser, field_access)
   test(structs + "kprobe:f { ((struct type1)cpu).field }", 0);
   test(structs + "kprobe:f { $x = (struct type1)cpu; $x.field }", 0);
   test(structs + "kprobe:f { @x = (struct type1)cpu; @x.field }", 0);
-  test("struct task_struct {int x;} kprobe:f { curtask->x }", 0);
 }
 
 TEST(semantic_analyser, field_access_wrong_field)
@@ -1306,12 +1314,21 @@ TEST(semantic_analyser, positional_parameters)
   test(bpftrace, "kprobe:f { printf(\"%s\", str($0)); }", 1);
 
   test(bpftrace, "kprobe:f { printf(\"%d\", $1); }", 0);
-  test(bpftrace, "kprobe:f { printf(\"%s\", str($1)); }", 10);
+  test(bpftrace, "kprobe:f { printf(\"%s\", str($1)); }", 0);
 
   test(bpftrace, "kprobe:f { printf(\"%s\", str($2)); }", 0);
+  test(bpftrace, "kprobe:f { printf(\"%s\", str($2 + 1)); }", 0);
   test(bpftrace, "kprobe:f { printf(\"%d\", $2); }", 10);
 
   test(bpftrace, "kprobe:f { printf(\"%d\", $3); }", 0);
+
+  // Pointer arithmetic in str() for parameters
+  // Only str($1 + CONST) where CONST <= strlen($1) should be allowed
+  test(bpftrace, "kprobe:f { printf(\"%s\", str($1 + 1)); }", 0);
+  test(bpftrace, "kprobe:f { printf(\"%s\", str(1 + $1)); }", 0);
+  test(bpftrace, "kprobe:f { printf(\"%s\", str($1 + 4)); }", 10);
+  test(bpftrace, "kprobe:f { printf(\"%s\", str($1 * 2)); }", 10);
+  test(bpftrace, "kprobe:f { printf(\"%s\", str($1 + 1 + 1)); }", 1);
 
   // Parameters are not required to exist to be used:
   test(bpftrace, "kprobe:f { printf(\"%s\", str($4)); }", 0);
@@ -1319,6 +1336,9 @@ TEST(semantic_analyser, positional_parameters)
 
   test(bpftrace, "kprobe:f { printf(\"%d\", $#); }", 0);
   test(bpftrace, "kprobe:f { printf(\"%s\", str($#)); }", 10);
+
+  // Parameters can be used as string literals
+  test(bpftrace, "kprobe:f { printf(\"%d\", cgroupid(str($2))); }", 0);
 
   Driver driver(bpftrace);
   test(driver, "k:f { $1 }", 0);
@@ -1760,22 +1780,17 @@ TEST(semantic_analyser, tuple_assign_var)
 {
   BPFtrace bpftrace;
   Driver driver(bpftrace);
+  SizedType ty = CreateTuple({ CreateInt64(), CreateString(64) });
   test(driver, R"_(BEGIN { $t = (1, "str"); $t = (4, "other"); })_", 0);
 
   auto &stmts = driver.root_->probes->at(0)->stmts;
 
   // $t = (1, "str");
   auto assignment = static_cast<ast::AssignVarStatement *>(stmts->at(0));
-  auto ty = SizedType(Type::tuple, 8 + 64, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::string, 64, false);
   EXPECT_EQ(ty, assignment->var->type);
 
   // $t = (4, "other");
   assignment = static_cast<ast::AssignVarStatement *>(stmts->at(1));
-  ty = SizedType(Type::tuple, 8 + 64, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::string, 64, false);
   EXPECT_EQ(ty, assignment->var->type);
 }
 
@@ -1784,26 +1799,21 @@ TEST(semantic_analyser, tuple_assign_map)
 {
   BPFtrace bpftrace;
   Driver driver(bpftrace);
+  SizedType ty;
   test(driver, R"_(BEGIN { @ = (1, 3, 3, 7); @ = (0, 0, 0, 0); })_", 0);
 
   auto &stmts = driver.root_->probes->at(0)->stmts;
 
   // $t = (1, 3, 3, 7);
   auto assignment = static_cast<ast::AssignMapStatement *>(stmts->at(0));
-  auto ty = SizedType(Type::tuple, 4 * 8, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::integer, 8, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, false);
+  ty = CreateTuple(
+      { CreateInt64(), CreateUInt64(), CreateUInt64(), CreateUInt64() });
   EXPECT_EQ(ty, assignment->map->type);
 
   // $t = (0, 0, 0, 0);
   assignment = static_cast<ast::AssignMapStatement *>(stmts->at(1));
-  ty = SizedType(Type::tuple, 4 * 8, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
+  ty = CreateTuple(
+      { CreateInt64(), CreateInt64(), CreateInt64(), CreateInt64() });
   EXPECT_EQ(ty, assignment->map->type);
 }
 
@@ -1812,18 +1822,14 @@ TEST(semantic_analyser, tuple_nested)
 {
   BPFtrace bpftrace;
   Driver driver(bpftrace);
+  SizedType ty_inner = CreateTuple({ CreateInt64(), CreateInt64() });
+  SizedType ty = CreateTuple({ CreateInt64(), ty_inner });
   test(driver, R"_(BEGIN { $t = (1,(1,2)); })_", 0);
 
   auto &stmts = driver.root_->probes->at(0)->stmts;
 
   // $t = (1, "str");
   auto assignment = static_cast<ast::AssignVarStatement *>(stmts->at(0));
-  auto ty = SizedType(Type::tuple, 3 * 8, false);
-  ty.tuple_elems.emplace_back(Type::integer, 8, true);
-  ty.tuple_elems.emplace_back(Type::tuple, 2 * 8, false);
-  auto ty_inner = SizedType(Type::tuple, 2 * 8, false);
-  ty_inner.tuple_elems.emplace_back(Type::tuple, 2 * 8, false);
-  ty.tuple_elems.emplace_back(std::move(ty_inner));
   EXPECT_EQ(ty, assignment->var->type);
 }
 
@@ -1835,6 +1841,21 @@ TEST(semantic_analyser, multi_pass_type_inference_zero_size_int)
   // after seeing the `@i++`. On the second pass the correct size is
   // determined.
   test(*bpftrace, "BEGIN { if (!@i) { @i++; } }", 0);
+}
+
+TEST(semantic_analyser, call_kptr_uptr)
+{
+  test("k:f { @  = kptr((int8*) arg0); }", 0);
+  test("k:f { $a = kptr((int8*) arg0); }", 0);
+
+  test("k:f { @ = kptr(arg0); }", 10);
+  test("k:f { $a = kptr(arg0); }", 10);
+
+  test("k:f { @  = uptr((int8*) arg0); }", 0);
+  test("k:f { $a = uptr((int8*) arg0); }", 0);
+
+  test("k:f { @ = uptr(arg0); }", 10);
+  test("k:f { $a = uptr(arg0); }", 10);
 }
 
 #ifdef HAVE_LIBBPF_BTF_DUMP

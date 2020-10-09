@@ -26,6 +26,14 @@ and this project adheres to
   - [#1476](https://github.com/iovisor/bpftrace/pull/1476)
 - List retprobes
   - [#1484](https://github.com/iovisor/bpftrace/pull/1484)
+- Resolve unknown typedefs using BTF and give a hint when a type cannot be found
+  - [#1485](https://github.com/iovisor/bpftrace/pull/1485)
+- Support multi-matched globbed targets for uprobe and ustd probes
+  - [#1499](https://github.com/iovisor/bpftrace/pull/1499)
+- Positional parameters: support numbers as strings and params as string literals
+  - [#1514](https://github.com/iovisor/bpftrace/pull/1514)
+- Support for tracepoint __data_loc fields
+  - [#1542](https://github.com/iovisor/bpftrace/pull/1542)
 
 #### Changed
 - Warn if using `print` on `stats` maps with top and div arguments
@@ -34,12 +42,20 @@ and this project adheres to
   - [#1439](https://github.com/iovisor/bpftrace/pull/1439)
 - Improve error messages for kfunc probe types
   - [#1451](https://github.com/iovisor/bpftrace/pull/1451)
+- Better handling of empty usdt namespaces
+  - [#1486](https://github.com/iovisor/bpftrace/pull/1486)
+- Switch `nsecs` to `ktime_get_boot_ns`
+  - [#1475](https://github.com/iovisor/bpftrace/pull/1475)
+- Tracepoint __data_loc fields are renamed from `args->data_loc_name` to `args->name`
+  - [#1542](https://github.com/iovisor/bpftrace/pull/1542)
 
 #### Deprecated
 
 #### Removed
 - Disable some kfunc probes whose tracing crashes
   - [#1432](https://github.com/iovisor/bpftrace/pull/1432)
+- Disable the --btf option
+  - [#1506](https://github.com/iovisor/bpftrace/pull/1506)
 
 #### Fixed
 - Fix negative overflow bug and unstable tests in PR #1416
@@ -50,11 +66,29 @@ and this project adheres to
   - [#1457](https://github.com/iovisor/bpftrace/pull/1457)
 - Fix type resolution for struct field access via variables
   - [#1450](https://github.com/iovisor/bpftrace/pull/1450)
+- Fix wrong setting of vmlinux_location.raw when offset kprobe used
+  - [#1530](https://github.com/iovisor/bpftrace/pull/1530)
+- Fix pointer arithmetic for positional parameters
+  - [#1514](https://github.com/iovisor/bpftrace/pull/1514)
+- SEGV when using perf format for stacks
+  - [#1524](https://github.com/iovisor/bpftrace/pull/1524)
 
 #### Tools
+- Hook up execsnoop.bt script onto `execveat` call
+  - [#1490](https://github.com/iovisor/bpftrace/pull/1490)
+- Support new capabilities for capable.bt
+  - [#1498](https://github.com/iovisor/bpftrace/pull/1498)
 
 #### Documentation
 
+## [0.11.1] 2020-09-22
+
+Bug fix release for the [Docker build](https://quay.io/repository/iovisor/bpftrace)
+
+### Fixed
+
+- Don't strip END_trigger
+  - [#1513](https://github.com/iovisor/bpftrace/pull/1513)
 
 ## [0.11.0] 2020-07-15
 

@@ -221,8 +221,8 @@ TEST(clang_parser, nested_struct_no_type)
   // since they are called bar and baz
   parse("struct Foo { struct { int x; } bar; union { int y; } baz; }", bpftrace);
 
-  std::string bar = "struct Foo::(anonymous at definitions.h:1:14)";
-  std::string baz = "union Foo::(anonymous at definitions.h:1:37)";
+  std::string bar = "struct Foo::(anonymous at definitions.h:2:14)";
+  std::string baz = "union Foo::(anonymous at definitions.h:2:37)";
   StructMap &structs = bpftrace.structs_;
 
   ASSERT_EQ(structs.size(), 3U);
@@ -655,6 +655,43 @@ TEST_F(clang_parser_btf, btf_variable_field_struct)
   EXPECT_NE(bpftrace.btf_set_.find("struct Foo2"), bpftrace.btf_set_.end());
   EXPECT_NE(bpftrace.btf_set_.find("struct Foo3"), bpftrace.btf_set_.end());
 }
+
+TEST(clang_parser, btf_unresolved_typedef)
+{
+  // size_t is defined in stddef.h, but if we have BTF, it should be possible to
+  // extract it from there
+  BPFtrace bpftrace;
+  parse("struct Foo { size_t x; };", bpftrace);
+
+  StructMap &structs = bpftrace.structs_;
+
+  ASSERT_EQ(structs.count("struct Foo"), 1U);
+
+  EXPECT_EQ(structs["struct Foo"].size, 8);
+  ASSERT_EQ(structs["struct Foo"].fields.size(), 1U);
+  ASSERT_EQ(structs["struct Foo"].fields.count("x"), 1U);
+
+  EXPECT_EQ(structs["struct Foo"].fields["x"].type.type, Type::integer);
+  EXPECT_EQ(structs["struct Foo"].fields["x"].type.size, 8U);
+  EXPECT_EQ(structs["struct Foo"].fields["x"].offset, 0);
+}
+
+TEST_F(clang_parser_btf, btf_uprobe_type_override)
+{
+  // Overriding a structure from BTF should not fail for a userspace probe
+  BPFtrace bpftrace;
+  parse("struct Foo1 { int a; };\n",
+        bpftrace,
+        true,
+        "uprobe:/bin/sh:f {@x = (struct Foo1 *) curtask;}");
+
+  StructMap &structs = bpftrace.structs_;
+  ASSERT_EQ(structs.size(), 1U);
+  ASSERT_EQ(structs.count("struct Foo1"), 1U);
+
+  ASSERT_EQ(structs["struct Foo1"].fields.size(), 1U);
+  ASSERT_EQ(structs["struct Foo1"].fields.count("a"), 1U);
+}
 #endif // HAVE_LIBBPF_BTF_DUMP
 
 TEST(clang_parser, struct_typedef)
@@ -714,6 +751,44 @@ TEST(clang_parser, struct_qualifiers)
 
   EXPECT_TRUE(SB.fields["a2"].type.IsRecordTy());
   EXPECT_EQ(SB.fields["a2"].type.GetName(), "struct a");
+}
+
+TEST(clang_parser, redefined_types)
+{
+  BPFtrace bpftrace;
+  parse("struct a {int a}; struct a {int a};", bpftrace, false);
+  parse("struct a {int a}; struct a {int a; short b;};", bpftrace, false);
+}
+
+TEST(clang_parser, data_loc_annotation)
+{
+  BPFtrace bpftrace;
+  std::string input = R"_(
+struct _tracepoint_irq_irq_handler_entry
+{
+  int common_pid;
+  int irq;
+  __attribute__((annotate("tp_data_loc"))) char * name;
+};
+  )_";
+  parse(input, bpftrace);
+
+  StructMap &structs = bpftrace.structs_;
+  ASSERT_EQ(structs.count("struct _tracepoint_irq_irq_handler_entry"), 1UL);
+
+  auto &s = structs["struct _tracepoint_irq_irq_handler_entry"];
+  EXPECT_EQ(s.size, 16);
+  EXPECT_EQ(s.fields.size(), 3U);
+
+  EXPECT_TRUE(s.fields["common_pid"].type.IsIntTy());
+  EXPECT_TRUE(s.fields["irq"].type.IsIntTy());
+
+  // The parser needs to rewrite __data_loc fields to be u64 so it can hold
+  // a pointer to the actual data. The kernel tracepoint infra exports an
+  // encoded u32 which codegen will know how to decode.
+  EXPECT_TRUE(s.fields["name"].is_data_loc);
+  ASSERT_TRUE(s.fields["name"].type.IsIntTy());
+  EXPECT_EQ(s.fields["name"].type.GetIntBitWidth(), 64ULL);
 }
 
 } // namespace clang_parser

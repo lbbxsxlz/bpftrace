@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "log.h"
+#include "struct.h"
 #include "types.h"
 
 namespace bpftrace {
@@ -10,6 +11,18 @@ namespace bpftrace {
 std::ostream &operator<<(std::ostream &os, Type type)
 {
   os << typestr(type);
+  return os;
+}
+
+std::ostream &operator<<(std::ostream &os, AddrSpace as)
+{
+  os << addrspacestr(as);
+  return os;
+}
+
+std::ostream &operator<<(std::ostream &os, ProbeType type)
+{
+  os << probetypeName(type);
   return os;
 }
 
@@ -40,10 +53,10 @@ std::ostream &operator<<(std::ostream &os, const SizedType &type)
   else if (type.IsTupleTy())
   {
     os << "(";
-    size_t n = type.tuple_elems.size();
+    size_t n = type.GetFieldCount();
     for (size_t i = 0; i < n; ++i)
     {
-      os << type.tuple_elems[i];
+      os << type.GetField(i).type;
       if (i != n - 1)
         os << ",";
     }
@@ -111,6 +124,24 @@ bool SizedType::IsStack() const
   return type == Type::ustack || type == Type::kstack;
 }
 
+std::string addrspacestr(AddrSpace as)
+{
+  switch (as)
+  {
+    case AddrSpace::kernel:
+      return "kernel";
+      break;
+    case AddrSpace::user:
+      return "user";
+      break;
+    case AddrSpace::none:
+      return "none";
+      break;
+  }
+
+  return {}; // unreached
+}
+
 std::string typestr(Type t)
 {
   switch (t)
@@ -143,10 +174,9 @@ std::string typestr(Type t)
     case Type::tuple:    return "tuple";    break;
     case Type::timestamp:return "timestamp";break;
     // clang-format on
-    default:
-      LOG(FATAL) << "call or probe type not found";
   }
-  // lgtm[cpp/missing-return]
+
+  return {}; // unreached
 }
 
 ProbeType probetype(const std::string &probeName)
@@ -199,10 +229,17 @@ std::string probetypeName(ProbeType t)
     case ProbeType::watchpoint:  return "watchpoint";  break;
     case ProbeType::kfunc:       return "kfunc";       break;
     case ProbeType::kretfunc:    return "kretfunc";    break;
-    default:
-      LOG(FATAL) << "probe type not found";
   }
-  // lgtm[cpp/missing-return]
+
+  return {}; // unreached
+}
+
+bool is_userspace_probe(const std::string &probe_name)
+{
+  auto probe_type = probetype(probe_name);
+  return (probe_type == ProbeType::uprobe && probe_name != "BEGIN" &&
+          probe_name != "END") ||
+         probe_type == ProbeType::uretprobe || probe_type == ProbeType::usdt;
 }
 
 uint64_t asyncactionint(AsyncAction a)
@@ -217,8 +254,16 @@ SizedType CreateInteger(size_t bits, bool is_signed)
   // analysis when we're inferring types, the first pass may not have
   // enough information to figure out the exact size of the integer. Later
   // passes infer the exact size.
-  assert(bits == 0 || bits == 8 || bits == 16 || bits == 32 || bits == 64);
-  return SizedType(Type::integer, bits / 8, is_signed);
+  assert(bits == 0 || bits == 1 || bits == 8 || bits == 16 || bits == 32 ||
+         bits == 64);
+  auto t = SizedType(Type::integer, bits / 8, is_signed);
+  t.size_bits = bits;
+  return t;
+}
+
+SizedType CreateBool(void)
+{
+  return CreateInteger(1, false);
 }
 
 SizedType CreateInt(size_t bits)
@@ -294,11 +339,12 @@ SizedType CreateArray(size_t num_elements, const SizedType &element_type)
   return ty;
 }
 
-SizedType CreatePointer(const SizedType &pointee_type)
+SizedType CreatePointer(const SizedType &pointee_type, AddrSpace as)
 {
   // Pointer itself is always an uint64
   auto ty = SizedType(Type::pointer, 8);
   ty.element_type_ = new SizedType(pointee_type);
+  ty.SetAS(as);
   return ty;
 }
 
@@ -398,9 +444,59 @@ SizedType CreateTimestamp()
   return SizedType(Type::timestamp, 16);
 }
 
+SizedType CreateTuple(const std::vector<SizedType> &fields)
+{
+  auto s = SizedType(Type::tuple, 0);
+  s.tuple_fields = Tuple::Create(fields);
+  s.size = s.tuple_fields->size;
+  return s;
+}
+
 bool SizedType::IsSigned(void) const
 {
   return is_signed_;
+}
+
+std::vector<Field> &SizedType::GetFields() const
+{
+  assert(IsTupleTy());
+  return tuple_fields->fields;
+}
+
+Field &SizedType::GetField(ssize_t n) const
+{
+  assert(IsTupleTy());
+  if (n >= GetFieldCount())
+    throw std::runtime_error("Getfield(): out of bound");
+  return tuple_fields->fields[n];
+}
+
+ssize_t SizedType::GetFieldCount() const
+{
+  assert(IsTupleTy());
+  return tuple_fields->fields.size();
+}
+
+void SizedType::DumpStructure(std::ostream &os)
+{
+  assert(IsTupleTy());
+  return tuple_fields->Dump(os);
+}
+
+ssize_t SizedType::GetAlignment() const
+{
+  if (IsStringTy())
+    return 1;
+
+  if (IsTupleTy())
+    return tuple_fields->align;
+
+  if (size <= 2)
+    return size;
+  else if (size <= 4)
+    return 4;
+  else
+    return 8;
 }
 
 } // namespace bpftrace
