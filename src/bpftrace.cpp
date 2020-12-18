@@ -118,6 +118,7 @@ std::set<std::string> find_wildcard_matches_internal(
 } // namespace
 
 DebugLevel bt_debug = DebugLevel::kNone;
+bool bt_quiet = false;
 bool bt_verbose = false;
 volatile sig_atomic_t BPFtrace::exitsig_recv = false;
 const int FMT_BUF_SZ = 512;
@@ -157,19 +158,18 @@ std::string format(std::string fmt,
     retstr += fmt.substr(literal_text_pos,
                          tokens_begin->position() - literal_text_pos);
     // replace current specifier with an arg
-    int r = snprintf(buffer.data(),
-                     buffer.capacity(),
-                     tokens_begin->str().c_str(),
-                     args.at(i)->value());
+    int r = args.at(i)->print(buffer.data(),
+                              buffer.capacity(),
+                              tokens_begin->str().c_str());
+
     check_snprintf_ret(r);
     if (static_cast<size_t>(r) >= buffer.capacity())
     {
       // the buffer is not big enough to hold the string, resize it
       buffer.resize(r + 1);
-      r = snprintf(buffer.data(),
-                   buffer.capacity(),
-                   tokens_begin->str().c_str(),
-                   args.at(i)->value());
+      int r = args.at(i)->print(buffer.data(),
+                                buffer.capacity(),
+                                tokens_begin->str().c_str());
       check_snprintf_ret(r);
     }
     retstr += std::string(buffer.data());
@@ -590,7 +590,7 @@ void perf_event_printer(void *cb_cookie, void *data, int size)
     const SizedType &ty = bpftrace->non_map_print_args_.at(print->print_id);
 
     std::vector<uint8_t> bytes;
-    for (size_t i = 0; i < ty.size; ++i)
+    for (size_t i = 0; i < ty.GetSize(); ++i)
       bytes.emplace_back(reinterpret_cast<uint8_t>(print->content[i]));
 
     bpftrace->out_->value(*bpftrace, ty, bytes);
@@ -718,35 +718,66 @@ std::vector<std::unique_ptr<IPrintable>> BPFtrace::get_arg_values(const std::vec
     switch (arg.type.type)
     {
       case Type::integer:
-        switch (arg.type.size)
+        if (arg.type.IsSigned())
         {
-          case 8:
-            arg_values.push_back(std::make_unique<PrintableInt>(
-                *reinterpret_cast<uint64_t *>(arg_data + arg.offset)));
-            break;
-          case 4:
-            arg_values.push_back(std::make_unique<PrintableInt>(
-                *reinterpret_cast<uint32_t *>(arg_data + arg.offset)));
-            break;
-          case 2:
-            arg_values.push_back(std::make_unique<PrintableInt>(
-                *reinterpret_cast<uint16_t *>(arg_data + arg.offset)));
-            break;
-          case 1:
-            arg_values.push_back(std::make_unique<PrintableInt>(
-                *reinterpret_cast<uint8_t *>(arg_data + arg.offset)));
-            break;
-          default:
-            LOG(FATAL) << "get_arg_values: invalid integer size. 8, 4, 2 and "
-                          "byte supported. "
-                       << arg.type.size << "provided";
+          int64_t val = 0;
+          switch (arg.type.GetIntBitWidth())
+          {
+            case 64:
+              val = *reinterpret_cast<int64_t *>(arg_data + arg.offset);
+              break;
+            case 32:
+              val = *reinterpret_cast<int32_t *>(arg_data + arg.offset);
+              break;
+            case 16:
+              val = *reinterpret_cast<int16_t *>(arg_data + arg.offset);
+              break;
+            case 8:
+              val = *reinterpret_cast<int8_t *>(arg_data + arg.offset);
+              break;
+            case 1:
+              val = *reinterpret_cast<int8_t *>(arg_data + arg.offset);
+              break;
+            default:
+              LOG(FATAL) << "get_arg_values: invalid integer size. 8, 4, 2 and "
+                            "byte supported. "
+                         << arg.type.GetSize() << "provided";
+          }
+          arg_values.push_back(std::make_unique<PrintableSInt>(val));
+        }
+        else
+        {
+          uint64_t val = 0;
+          switch (arg.type.GetIntBitWidth())
+          {
+            case 64:
+              val = *reinterpret_cast<uint64_t *>(arg_data + arg.offset);
+              break;
+            case 32:
+              val = *reinterpret_cast<uint32_t *>(arg_data + arg.offset);
+              break;
+            case 16:
+              val = *reinterpret_cast<uint16_t *>(arg_data + arg.offset);
+              break;
+            case 8:
+              val = *reinterpret_cast<uint8_t *>(arg_data + arg.offset);
+              break;
+            case 1:
+              val = *reinterpret_cast<uint8_t *>(arg_data + arg.offset);
+              break;
+            default:
+              LOG(FATAL) << "get_arg_values: invalid integer size. 8, 4, 2 and "
+                            "byte supported. "
+                         << arg.type.GetSize() << "provided";
+          }
+          arg_values.push_back(std::make_unique<PrintableInt>(val));
         }
         break;
       case Type::string:
       {
         auto p = reinterpret_cast<char *>(arg_data + arg.offset);
         arg_values.push_back(std::make_unique<PrintableString>(
-            std::string(p, strnlen(p, arg.type.size))));
+            std::string(p, strnlen(p, arg.type.GetSize()))));
         break;
       }
       case Type::buffer:
@@ -855,9 +886,10 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_usdt_probe(
 {
   std::vector<std::unique_ptr<AttachedProbe>> ret;
 
-  if (!(file_activation && probe.path.size()))
+  if (feature_->has_uprobe_refcnt() || !(file_activation && probe.path.size()))
   {
-    ret.emplace_back(std::make_unique<AttachedProbe>(probe, func, pid));
+    ret.emplace_back(
+        std::make_unique<AttachedProbe>(probe, func, pid, *feature_));
     return ret;
   }
 
@@ -865,17 +897,22 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_usdt_probe(
   // which processes have the target executable in their address space
   // with execute permission. If found, we will try to attach to each
   // process we find.
+  //
+  // Note that this is the slow path. If the kernel has semaphore support
+  // (feature_->has_uprobe_refcnt()), the kernel can do this for us and
+  // much faster too.
   glob_t globbuf;
   if (::glob("/proc/[0-9]*/maps", GLOB_NOSORT, nullptr, &globbuf))
     throw std::runtime_error("failed to glob");
 
-  const char *p;
+  char *p;
   if (!(p = realpath(probe.path.c_str(), nullptr)))
   {
     LOG(ERROR) << "Failed to resolve " << probe.path;
     return ret;
   }
   std::string resolved(p);
+  free(p);
 
   for (size_t i = 0; i < globbuf.gl_pathc; ++i)
   {
@@ -913,7 +950,7 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_usdt_probe(
       }
 
       ret.emplace_back(
-          std::make_unique<AttachedProbe>(probe, func, pid_parsed));
+          std::make_unique<AttachedProbe>(probe, func, pid_parsed, *feature_));
       break;
     }
   }
@@ -966,7 +1003,7 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_probe(
     else if (probe.type == ProbeType::watchpoint)
     {
       ret.emplace_back(
-          std::make_unique<AttachedProbe>(probe, func->second, pid));
+          std::make_unique<AttachedProbe>(probe, func->second, pid, *feature_));
       return ret;
     }
     else
@@ -1298,7 +1335,7 @@ int BPFtrace::zero_map(IMap &map)
     old_key = key;
   }
 
-  int value_size = map.type_.size * nvalues;
+  int value_size = map.type_.GetSize() * nvalues;
   std::vector<uint8_t> zero(value_size, 0);
   for (auto &key : keys)
   {
@@ -1342,7 +1379,7 @@ std::string BPFtrace::map_value_to_str(const SizedType &stype,
   else if (stype.IsStringTy())
   {
     auto p = reinterpret_cast<const char *>(value.data());
-    return std::string(p, strnlen(p, stype.size));
+    return std::string(p, strnlen(p, stype.GetSize()));
   }
   else if (stype.IsCountTy())
     return std::to_string(reduce_value<uint64_t>(value, nvalues) / div);
@@ -1427,7 +1464,7 @@ int BPFtrace::print_map(IMap &map, uint32_t top, uint32_t div)
 
   while (bpf_get_next_key(map.mapfd_, old_key.data(), key.data()) == 0)
   {
-    int value_size = map.type_.size;
+    int value_size = map.type_.GetSize();
     value_size *= nvalues;
     auto value = std::vector<uint8_t>(value_size);
     int err = bpf_lookup_elem(map.mapfd_, key.data(), value.data());
@@ -1514,7 +1551,7 @@ int BPFtrace::print_map_hist(IMap &map, uint32_t top, uint32_t div)
     for (size_t i=0; i<map.key_.size(); i++)
       key_prefix.at(i) = key.at(i);
 
-    int value_size = map.type_.size * nvalues;
+    int value_size = map.type_.GetSize() * nvalues;
     auto value = std::vector<uint8_t>(value_size);
     int err = bpf_lookup_elem(map.mapfd_, key.data(), value.data());
     if (err == -1)
@@ -1593,7 +1630,7 @@ int BPFtrace::print_map_stats(IMap &map, uint32_t top, uint32_t div)
     for (size_t i=0; i<map.key_.size(); i++)
       key_prefix.at(i) = key.at(i);
 
-    int value_size = map.type_.size * nvalues;
+    int value_size = map.type_.GetSize() * nvalues;
     auto value = std::vector<uint8_t>(value_size);
     int err = bpf_lookup_elem(map.mapfd_, key.data(), value.data());
     if (err == -1)
@@ -1699,7 +1736,7 @@ std::vector<uint8_t> BPFtrace::find_empty_key(IMap &map, size_t size) const
   if (size == 0) size = 8;
   auto key = std::vector<uint8_t>(size);
   uint32_t nvalues = map.is_per_cpu_type() ? ncpus_ : 1;
-  int value_size = map.type_.size * nvalues;
+  int value_size = map.type_.GetSize() * nvalues;
   auto value = std::vector<uint8_t>(value_size);
 
   if (bpf_lookup_elem(map.mapfd_, key.data(), value.data()))
@@ -2125,7 +2162,7 @@ void BPFtrace::sort_by_key(std::vector<SizedType> key_args,
   int arg_offset = 0;
   for (auto arg : key_args)
   {
-    arg_offset += arg.size;
+    arg_offset += arg.GetSize();
   }
 
   // Sort the key arguments in reverse order so the results are sorted by
@@ -2133,11 +2170,11 @@ void BPFtrace::sort_by_key(std::vector<SizedType> key_args,
   for (size_t i=key_args.size(); i-- > 0; )
   {
     auto arg = key_args.at(i);
-    arg_offset -= arg.size;
+    arg_offset -= arg.GetSize();
 
     if (arg.IsIntTy())
     {
-      if (arg.size == 8)
+      if (arg.GetSize() == 8)
       {
         std::stable_sort(
             values_by_key.begin(), values_by_key.end(), [&](auto &a, auto &b) {
@@ -2146,7 +2183,7 @@ void BPFtrace::sort_by_key(std::vector<SizedType> key_args,
               return va < vb;
             });
       }
-      else if (arg.size == 4)
+      else if (arg.GetSize() == 4)
       {
         std::stable_sort(
             values_by_key.begin(), values_by_key.end(), [&](auto &a, auto &b) {
@@ -2158,7 +2195,7 @@ void BPFtrace::sort_by_key(std::vector<SizedType> key_args,
       else
       {
         LOG(FATAL) << "invalid integer argument size. 4 or 8  expected, but "
-                   << arg.size << " provided";
+                   << arg.GetSize() << " provided";
       }
 
     }
@@ -2168,7 +2205,7 @@ void BPFtrace::sort_by_key(std::vector<SizedType> key_args,
           values_by_key.begin(), values_by_key.end(), [&](auto &a, auto &b) {
             return strncmp((const char *)(a.first.data() + arg_offset),
                            (const char *)(b.first.data() + arg_offset),
-                           arg.size) < 0;
+                           arg.GetSize()) < 0;
           });
     }
 

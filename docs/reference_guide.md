@@ -90,6 +90,9 @@ discussion to other files in /docs, the /tools/\*\_examples.txt files, or blog p
     - [22. `sizeof()`: Size of type or expression](#22-sizeof-size-of-type-or-expression)
     - [23. `print()`: Print Value](#23-print-print-value)
     - [24. `strftime()`: Formatted timestamp](#24-strftime-formatted-timestamp)
+    - [25. `path()`: Return full path](#25-path-return-full-path)
+    - [26. `uptr()`: Annotate userspace pointer](#26-uptr-annotate-userspace-pointer)
+    - [27. `kptr()`: Annotate kernelspace pointer](#27-kptr-annotate-kernelspace-pointer)
 - [Map Functions](#map-functions)
     - [1. Builtins](#1-builtins-2)
     - [2. `count()`: Count](#2-count-count)
@@ -138,6 +141,7 @@ OPTIONS:
     -B MODE        output buffering mode ('line', 'full', or 'none')
     -d             debug info dry run
     -dd            verbose debug info dry run
+    -b             force BTF (BPF type format) processing
     -e 'program'   execute this program
     -h             show this help message
     -I DIR         add the specified DIR to the search path for include files.
@@ -145,6 +149,7 @@ OPTIONS:
     -l [search]    list probes
     -p PID         enable USDT probes on PID
     -c 'CMD'       run CMD and enable USDT probes on resulting process
+    -q             keep messages quiet
     -v             verbose messages
     -k             emit a warning when a bpf helper returns an error (except read functions)
     -kk            check all bpf helper functions
@@ -298,7 +303,6 @@ If BTF is available, it is also possible to list struct/union/emum definitions. 
 
 ```
 # bpftrace -lv "struct path"
-BTF: using data from /sys/kernel/btf/vmlinux
 struct path {
         struct vfsmount *mnt;
         struct dentry *dentry;
@@ -365,7 +369,7 @@ The `-v` option prints more information about the program as it is run:
 # bpftrace -v -e 'tracepoint:syscalls:sys_enter_nanosleep { printf("%s is sleeping.\n", comm); }'
 Attaching 1 probe...
 
-Bytecode:
+The verifier log:
 0: (bf) r6 = r1
 1: (b7) r1 = 0
 2: (7b) *(u64 *)(r10 -24) = r1
@@ -401,7 +405,7 @@ iscsid is sleeping.
 [...]
 ```
 
-This includes `Bytecode:` and then the eBPF bytecode after it was compiled from the llvm assembly.
+This includes `The verifier log:` and then the log message from the in-kernel vertifier.
 
 ## 7. Preprocessor Options
 
@@ -806,7 +810,7 @@ The `return` keyword is used to exit the current probe. This differs from
 
 N-tuples are supported, where N is any integer greater than 1.
 
-Indexing is supported using the `.` operator.
+Indexing is supported using the `.` operator. Tuples are immutable once created.
 
 Example:
 
@@ -1241,8 +1245,8 @@ hi
 ^C
 ```
 
-The namespace of the probe is deduced automatically. If the binary `/root/tick` contained multiple probes 
-with the name `loop` (e.g. `tick:loop` and `tock:loop`), no probe would be attached. 
+The namespace of the probe is deduced automatically. If the binary `/root/tick` contained multiple probes
+with the name `loop` (e.g. `tick:loop` and `tock:loop`), no probe would be attached.
 This may be solved by manually specifying the namespace or by using a wildcard:
 
 ```
@@ -1266,7 +1270,18 @@ hi
 ^C
 ```
 
-bpftrace also supports USDT semaphores. You may activate semaphores by passing in `-p $PID` or
+bpftrace also supports USDT semaphores. If both your environment and bpftrace
+support uprobe refcounts, then USDT semaphores are automatically activated for
+all processes upon probe attachment (and `--usdt-file-activation` becomes a
+noop). You can check if your system supports uprobe refcounts by running:
+
+```
+# bpftrace --info 2>&1 | grep "uprobe refcount"
+  bcc bpf_attach_uprobe refcount: yes
+  uprobe refcount (depends on Build:bcc bpf_attach_uprobe refcount): yes
+```
+
+If your system does not support uprobe refcounts, you may activate semaphores by passing in `-p $PID` or
 `--usdt-file-activation`. `--usdt-file-activation` looks through `/proc` to find processes that
 have your probe's binary mapped with executable permissions into their address space and then tries
 to attach your probe. Note that file activation occurs only once (during attach time). In other
@@ -1464,7 +1479,8 @@ Examples in situ:
 
 ## 14. `watchpoint`: Memory watchpoints
 
-**WARNING**: this feature is experimental and may be subject to interface changes.
+**WARNING**: this feature is experimental and may be subject to interface changes. Memory watchpoints are
+also architecture dependant
 
 Syntax:
 
@@ -1473,15 +1489,43 @@ watchpoint::hex_address:length:mode
 ```
 
 These are memory watchpoints provided by the kernel. Whenever a memory address is written to (`w`), read
-from (`r`), or executed (`x`), the kernel can generate an event. Note that a pid (`-p`) or a command
-(`-c`) must be provided to bpftrace. Also note you may not monitor for execution while monitoring read or
-write.
+from (`r`), or executed (`x`), the kernel can generate an event. If you want to add watchpoint for
+an userspace process, a pid (`-p`) or a command (`-c`) must be provided to bpftrace. If not, bpftrace
+will take the address as kernel space address. Also note you may not monitor for execution while
+monitoring read or write.
 
 Examples:
 
 ```
-bpftrace -e 'watchpoint::0x10000000:8:rw { printf("hit!\n"); }' -c ~/binary
+bpftrace -e 'watchpoint::0x10000000:8:rw { printf("hit!\n"); exit(); }' -c ./testprogs/watchpoint
 ```
+
+It will output "hit" and exit when the watchpoint process is trying to read or write 0x10000000.
+
+```
+# bpftrace -e "watchpoint::0x$(awk '$3 == "jiffies" {print $1}' /proc/kallsyms):8:w {@[kstack] = count();}"
+Attaching 1 probe...
+^C
+......
+@[
+    do_timer+12
+    tick_do_update_jiffies64.part.22+89
+    tick_sched_do_timer+103
+    tick_sched_timer+39
+    __hrtimer_run_queues+256
+    hrtimer_interrupt+256
+    smp_apic_timer_interrupt+106
+    apic_timer_interrupt+15
+    cpuidle_enter_state+188
+    cpuidle_enter+41
+    do_idle+536
+    cpu_startup_entry+25
+    start_secondary+355
+    secondary_startup_64+164
+]: 319
+```
+
+It shows the kernel stacks in which jiffies is updated.
 
 ## 15. `kfunc`/`kretfunc`: Kernel Functions Tracing
 
@@ -1574,7 +1618,7 @@ And as you can see in above example it's also possible to access function argume
 - `uid` - User ID
 - `gid` - Group ID
 - `nsecs` - Nanosecond timestamp
-- `elapsed` - Nanosecond timestamp since bpftrace initialization
+- `elapsed` - Nanoseconds since bpftrace initialization
 - `cpu` - Processor ID
 - `comm` - Process name
 - `kstack` - Kernel stack trace
@@ -1861,7 +1905,7 @@ be used as a string in the `str()` call. If a parameter is used that was not pro
 zero for numeric context, and "" for string context. Positional parameters may also be used in probe
 argument and will be treated as a string parameter.
 
-If a positional parameter is used in `str()`, it is interpreted as a pointer to the actual given string 
+If a positional parameter is used in `str()`, it is interpreted as a pointer to the actual given string
 literal, which allows to do pointer arithmetic on it. Only addition of a single constant, less or equal to
 the length of the supplied string, is allowed.
 
@@ -1958,6 +2002,13 @@ Tracing block I/O sizes > 0 bytes
 - `signal(char[] signal | u32 signal)` - Send a signal to the current task
 - `strncmp(char *s1, char *s2, int length)` - Compare first n characters of two strings
 - `override(u64 rc)` - Override return value
+- `buf(void *d [, length])` - Hex-format a buffer
+- `sizeof(...)` - Return size of a type or expression
+- `print(...)` - Print a non-map value with default formatting
+- `strftime(char *format, int nsecs)` - Return a formatted timestamp
+- `path(struct path *path)` - Return full path
+- `uptr(void *p)` - Annotate as userspace pointer
+- `kptr(void *p)` - Annotate as kernelspace pointer
 
 Some of these are asynchronous: the kernel queues the event, but some time later (milliseconds) it is
 processed in user-space. The asynchronous actions are: `printf()`, `time()`, and `join()`. Both `ksym()`
@@ -2047,7 +2098,7 @@ Syntax: `str(char *s [, int length])`
 
 Returns the string pointed to by s. `length` can be used to limit the size of the read, and/or introduce
 a null-terminator. By default, the string will have size 64 bytes (tuneable using [env var
-`BPFTRACE_STRLEN`](#7-env-bpftrace_strlen)).
+`BPFTRACE_STRLEN`](#91-bpftrace_strlen)).
 
 Examples:
 
@@ -2648,7 +2699,7 @@ Syntax: `buf(void *d [, int length])`
 Returns a hex-formatted string of the data pointed to by `d` that is safe to print. Because the
 length of the buffer cannot always be inferred, the `length` parameter may be provided to
 limit the number of bytes that are read. By default, the maximum number of bytes is 64, but this can
-be tuned using the [`BPFTRACE_STRLEN`](#7-env-bpftrace_strlen) environment variable.
+be tuned using the [`BPFTRACE_STRLEN`](#91-bpftrace_strlen) environment variable.
 
 For example, we can take the `buff` parameter (`void *`) of `sys_enter_sendto`, read the
 number of bytes specified by `len` (`size_t`), and format the bytes in hexadecimal so that
@@ -2693,7 +2744,7 @@ Attaching 1 probe...
 Attaching 1 probe...
 8
 
-# bpftrace -e 'BEGIN { printf("%d\n", sizeof(struct task_struct)); }'
+# bpftrace --btf -e 'BEGIN { printf("%d\n", sizeof(struct task_struct)); }'
 Attaching 1 probe...
 13120
 
@@ -2751,6 +2802,66 @@ Attaching 1 probe...
 13:11:26
 ^C
 ```
+
+## 25. `path()`: Return full path
+
+Syntax:
+- `path(struct path *path)`
+
+Return full path referenced by struct path pointer in argument.
+There's list of allowed kernel functions, that can use this
+helper in probe.
+
+Examples:
+```
+# bpftrace  -e 'kfunc:filp_close { printf("%s\n", path(args->filp->f_path)); }'
+Attaching 1 probe...
+/proc/sys/net/ipv6/conf/eno2/disable_ipv6
+/proc/sys/net/ipv6/conf/eno2/use_tempaddr
+socket:[23276]
+/proc/sys/net/ipv6/conf/eno2/disable_ipv6
+socket:[17655]
+/sys/devices/pci0000:00/0000:00:1c.5/0000:04:00.1/net/eno2/type
+socket:[38745]
+/proc/sys/net/ipv6/conf/eno2/disable_ipv6
+
+# bpftrace  -e 'kretfunc:dentry_open { printf("%s\n", path(retval->f_path)); }'
+Attaching 1 probe...
+/dev/pts/1 -> /dev/pts/1
+```
+
+## 26. `uptr()`: Annotate userspace pointer
+
+Syntax:
+- `uptr(void *p)`
+
+Annotate `p` as a pointer belonging to userspace address space.
+
+bpftrace can usually infer the address space of a pointer. However, there are
+corner cases where inference fails. For example, kernel functions that deal
+with userspace pointers (a parameter like `const char __user *p`). In these
+cases, you'll need to annotate the pointer.
+
+Examples:
+
+```
+# bpftrace -e 'kprobe:do_sys_open { printf("%s\n", str(uptr(arg1))) }'
+Attaching 1 probe...
+.
+state
+^C
+```
+
+## 27. `kptr()`: Annotate kernelspace pointer
+
+Syntax:
+- `kptr(void *p)`
+
+Annotate `p` as a pointer belonging to kernel address space.
+
+Just like `uptr`, you'll generally only need this if bpftrace has inferred the
+pointer address space incorrectly.
+
 
 # Map Functions
 

@@ -4,7 +4,7 @@ project(bpftrace)
 # bpftrace version number components.
 set(bpftrace_VERSION_MAJOR 0)
 set(bpftrace_VERSION_MINOR 11)
-set(bpftrace_VERSION_PATCH 1)
+set(bpftrace_VERSION_PATCH 4)
 
 include(GNUInstallDirs)
 
@@ -18,6 +18,9 @@ set(LLVM_VERSION "8" CACHE STRING "Embedded LLVM/Clang version to build and link
 set(BUILD_ASAN OFF CACHE BOOL "Build bpftrace with -fsanitize=address")
 set(ENABLE_MAN ON CACHE BOOL "Build man pages")
 set(ENABLE_TEST_VALIDATE_CODEGEN ON CACHE BOOL "Run LLVM IR validation tests")
+set(BUILD_FUZZ OFF CACHE BOOL "Build bpftrace for fuzzing")
+set(USE_LIBFUZZER OFF CACHE BOOL "Use libfuzzer for fuzzing")
+set(FUZZ_TARGET "codegen" CACHE STRING "Fuzzing target")
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 

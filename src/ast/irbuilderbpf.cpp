@@ -48,7 +48,7 @@ libbpf::bpf_func_id IRBuilderBPF::selectProbeReadHelper(AddrSpace as, bool str)
 {
   libbpf::bpf_func_id fn;
   // Assume that if a kernel has probe_read_kernel it has the other 3 too
-  if (bpftrace_.feature_.has_helper_probe_read_kernel())
+  if (bpftrace_.feature_->has_helper_probe_read_kernel())
   {
     if (as == AddrSpace::kernel)
     {
@@ -65,6 +65,12 @@ libbpf::bpf_func_id IRBuilderBPF::selectProbeReadHelper(AddrSpace as, bool str)
       // if the kernel has the new helpers but AS is still none it is a bug
       // in bpftrace, assert catches it for debug builds.
       // assert(as != AddrSpace::none);
+      static bool warnonce = false;
+      if (!warnonce)
+      {
+        warnonce = true;
+        LOG(WARNING) << "Addrspace is not set";
+      }
       fn = str ? libbpf::BPF_FUNC_probe_read_str : libbpf::BPF_FUNC_probe_read;
     }
   }
@@ -173,7 +179,7 @@ AllocaInst *IRBuilderBPF::CreateAllocaBPFInit(const SizedType &stype, const std:
 
   if (needMemcpy(stype))
   {
-    CREATE_MEMSET(alloca, getInt8(0), stype.size, 1);
+    CREATE_MEMSET(alloca, getInt8(0), stype.GetSize(), 1);
   }
   else
   {
@@ -216,7 +222,7 @@ llvm::Type *IRBuilderBPF::GetType(const SizedType &stype)
   llvm::Type *ty;
   if (stype.IsArray())
   {
-    ty = ArrayType::get(getInt8Ty(), stype.size);
+    ty = ArrayType::get(getInt8Ty(), stype.GetSize());
   }
   else if (stype.IsTupleTy())
   {
@@ -239,11 +245,11 @@ llvm::Type *IRBuilderBPF::GetType(const SizedType &stype)
   }
   else if (stype.IsRecordTy())
   {
-    ty = ArrayType::get(getInt8Ty(), stype.size);
+    ty = ArrayType::get(getInt8Ty(), stype.GetSize());
   }
   else
   {
-    switch (stype.size)
+    switch (stype.GetSize())
     {
       case 16:
         ty = getInt128Ty();
@@ -261,7 +267,8 @@ llvm::Type *IRBuilderBPF::GetType(const SizedType &stype)
         ty = getInt8Ty();
         break;
       default:
-        LOG(FATAL) << stype.size << " is not a valid type size for GetType";
+        LOG(FATAL) << stype.GetSize()
+                   << " is not a valid type size for GetType";
     }
   }
   return ty;
@@ -356,7 +363,7 @@ Value *IRBuilderBPF::CreateMapLookupElem(Value *ctx,
 
   SetInsertPoint(lookup_success_block);
   if (needMemcpy(type))
-    CREATE_MEMCPY(value, call, type.size, 1);
+    CREATE_MEMCPY(value, call, type.GetSize(), 1);
   else
   {
     assert(value->getType()->isPointerTy() &&
@@ -369,7 +376,7 @@ Value *IRBuilderBPF::CreateMapLookupElem(Value *ctx,
 
   SetInsertPoint(lookup_failure_block);
   if (needMemcpy(type))
-    CREATE_MEMSET(value, getInt8(0), type.size, 1);
+    CREATE_MEMSET(value, getInt8(0), type.GetSize(), 1);
   else
     CreateStore(getInt64(0), value);
   CreateHelperError(ctx, getInt32(0), libbpf::BPF_FUNC_map_lookup_elem, loc);
@@ -592,10 +599,8 @@ Value *IRBuilderBPF::CreateUSDTReadArgument(Value *ctx,
     }
     else
     {
-      // Zero out `dst` in case we read less than 64 bits
-      CreateStore(getInt64(0), dst);
-      CreateProbeRead(ctx, dst, abs_size, reg, as, loc);
-      result = CreateLoad(dst);
+      result = CreateLoad(GetType(CreateInt(abs_size * 8)), reg);
+      result = CreateIntCast(result, getInt64Ty(), argument->size < 0);
     }
     CreateLifetimeEnd(dst);
   }
@@ -672,10 +677,9 @@ Value *IRBuilderBPF::CreateStrncmp(Value *ctx __attribute__((unused)),
                                    bool inverse)
 {
   assert(ctx && ctx->getType() == getInt8PtrTy());
-#ifndef NDEBUG
   PointerType *valp = cast<PointerType>(val->getType());
+#ifndef NDEBUG
   assert(valp->getElementType()->isArrayTy() &&
-         valp->getElementType()->getArrayNumElements() >= n &&
          valp->getElementType()->getArrayElementType() == getInt8Ty());
 #endif
 
@@ -685,18 +689,25 @@ Value *IRBuilderBPF::CreateStrncmp(Value *ctx __attribute__((unused)),
 
   CreateStore(getInt1(!inverse), store);
 
-  const char *c_str = str.c_str();
-  for (size_t i = 0; i < n; i++)
+  // If the size of array is smaller than n, the condition is always false
+  if (valp->getElementType()->getArrayNumElements() >= n)
   {
-    BasicBlock *char_eq = BasicBlock::Create(module_.getContext(), "strcmp.loop", parent);
+    const char *c_str = str.c_str();
+    for (size_t i = 0; i < n; i++)
+    {
+      BasicBlock *char_eq = BasicBlock::Create(module_.getContext(),
+                                               "strcmp.loop",
+                                               parent);
 
-    auto *ptr = CreateGEP(val, { getInt32(0), getInt32(i) });
-    Value *l = CreateLoad(getInt8Ty(), ptr);
-    Value *r = getInt8(c_str[i]);
-    Value *cmp = CreateICmpNE(l, r, "strcmp.cmp");
-    CreateCondBr(cmp, str_ne, char_eq);
-    SetInsertPoint(char_eq);
+      auto *ptr = CreateGEP(val, { getInt32(0), getInt32(i) });
+      Value *l = CreateLoad(getInt8Ty(), ptr);
+      Value *r = getInt8(c_str[i]);
+      Value *cmp = CreateICmpNE(l, r, "strcmp.cmp");
+      CreateCondBr(cmp, str_ne, char_eq);
+      SetInsertPoint(char_eq);
+    }
   }
+
   CreateStore(getInt1(inverse), store);
   CreateBr(str_ne);
 
@@ -1141,6 +1152,26 @@ void IRBuilderBPF::CreateHelperErrorCond(Value *ctx,
   CreateHelperError(ctx, ret, func_id, loc);
   CreateBr(helper_merge_block);
   SetInsertPoint(helper_merge_block);
+}
+
+void IRBuilderBPF::CreatePath(Value *ctx,
+                              AllocaInst *buf,
+                              Value *path,
+                              const location &loc)
+{
+  // int bpf_d_path(struct path *path, char *buf, u32 sz)
+  // Return: 0 or error
+  FunctionType *d_path_func_type = FunctionType::get(
+      getInt64Ty(), { getInt8PtrTy(), buf->getType(), getInt32Ty() }, false);
+  PointerType *d_path_func_ptr_type = PointerType::get(d_path_func_type, 0);
+  Constant *d_path_func = ConstantExpr::getCast(Instruction::IntToPtr,
+                                                getInt64(
+                                                    libbpf::BPF_FUNC_d_path),
+                                                d_path_func_ptr_type);
+  CallInst *call = createCall(d_path_func,
+                              { path, buf, getInt32(bpftrace_.strlen_) },
+                              "d_path");
+  CreateHelperErrorCond(ctx, call, libbpf::BPF_FUNC_d_path, loc);
 }
 
 } // namespace ast

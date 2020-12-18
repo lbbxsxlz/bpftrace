@@ -38,6 +38,7 @@ enum class DebugLevel;
 
 // globals
 extern DebugLevel bt_debug;
+extern bool bt_quiet;
 extern bool bt_verbose;
 
 enum class DebugLevel
@@ -90,7 +91,12 @@ struct HelperErrorInfo
 class BPFtrace
 {
 public:
-  BPFtrace(std::unique_ptr<Output> o = std::make_unique<TextOutput>(std::cout)) : out_(std::move(o)),ncpus_(get_possible_cpus().size()) { }
+  BPFtrace(std::unique_ptr<Output> o = std::make_unique<TextOutput>(std::cout))
+      : out_(std::move(o)),
+        feature_(std::make_unique<BPFfeature>()),
+        ncpus_(get_possible_cpus().size())
+  {
+  }
   virtual ~BPFtrace();
   virtual int add_probe(ast::Probe &p);
   int num_probes() const;
@@ -147,10 +153,10 @@ public:
   std::unordered_map<int64_t, struct HelperErrorInfo> helper_error_info_;
 
   std::vector<std::string> probe_ids_;
-  unsigned int join_argnum_;
-  unsigned int join_argsize_;
+  unsigned int join_argnum_ = 16;
+  unsigned int join_argsize_ = 1024;
   std::unique_ptr<Output> out_;
-  BPFfeature feature_;
+  std::unique_ptr<BPFfeature> feature_;
 
   uint64_t strlen_ = 64;
   uint64_t mapmax_ = 4096;
@@ -158,10 +164,12 @@ public:
   uint64_t max_probes_ = 512;
   uint64_t log_size_ = 1000000;
   uint64_t perf_rb_pages_ = 64;
+  uint64_t max_type_res_iterations = 0;
   bool demangle_cpp_symbols_ = true;
   bool resolve_user_symbols_ = true;
   bool cache_user_symbols_ = true;
   bool safe_mode_ = true;
+  bool force_btf_ = false;
   bool has_usdt_ = false;
   bool usdt_file_activation_ = false;
   int helper_check_level_ = 0;

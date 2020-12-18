@@ -27,6 +27,11 @@ static void usdt_probe_each(struct bcc_usdt *usdt_probe)
           .path = usdt_probe->bin_path,
           .provider = usdt_probe->provider,
           .name = usdt_probe->name,
+#ifdef LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE
+          .semaphore_offset = usdt_probe->semaphore_offset,
+#else
+          .semaphore_offset = 0,
+#endif
           .num_locations = usdt_probe->num_locations,
       });
 }
@@ -109,10 +114,10 @@ void USDTHelper::read_probes_for_pid(int pid)
     if (ctx == nullptr)
     {
       LOG(ERROR) << "failed to initialize usdt context for pid: " << pid;
+
       if (kill(pid, 0) == -1 && errno == ESRCH)
-      {
-        std::cerr << "hint: process not running" << std::endl;
-      }
+        LOG(ERROR) << "hint: process not running";
+
       return;
     }
     bcc_usdt_foreach(ctx, usdt_probe_each);

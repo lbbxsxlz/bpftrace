@@ -16,6 +16,13 @@ add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/tests/codegen_includes.cpp
     -P ${CMAKE_SOURCE_DIR}/tests/codegen/generate_codegen_includes.cmake
   DEPENDS ${CODEGEN_SOURCES})
 
+if(${LLVM_VERSION} VERSION_LESS 11.0.0)
+  set(CODEGEN_SRC ${CMAKE_BINARY_DIR}/tests/codegen_includes.cpp)
+else()
+  set(CODEGEN_SRC "")
+  message("Disabled codegen test for LLVM >= 11")
+endif()
+
 add_executable(bpftrace_test
   ast.cpp
   bpftrace.cpp
@@ -31,7 +38,7 @@ add_executable(bpftrace_test
   tracepoint_format_parser.cpp
   utils.cpp
 
-  ${CMAKE_BINARY_DIR}/tests/codegen_includes.cpp
+  ${CODEGEN_SRC}
 
   ${CMAKE_SOURCE_DIR}/src/attached_probe.cpp
   ${CMAKE_SOURCE_DIR}/src/bpftrace.cpp
@@ -109,6 +116,21 @@ endif(HAVE_BFD_DISASM)
 if(LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE)
   target_compile_definitions(bpftrace_test PRIVATE LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE)
 endif(LIBBCC_ATTACH_KPROBE_SIX_ARGS_SIGNATURE)
+if(LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE)
+  target_compile_definitions(bpftrace_test PRIVATE LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE)
+endif(LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE)
+
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  target_compile_definitions(bpftrace_test PRIVATE ARCH_AARCH64)
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64" OR
+       CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
+  target_compile_definitions(bpftrace_test PRIVATE ARCH_PPC64)
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "s390" OR
+       CMAKE_SYSTEM_PROCESSOR STREQUAL "s390x")
+  target_compile_definitions(bpftrace_test PRIVATE ARCH_S390)
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+  target_compile_definitions(bpftrace_test PRIVATE ARCH_X86_64)
+endif()
 
 target_link_libraries(bpftrace_test arch ast parser resources)
 

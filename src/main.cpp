@@ -5,12 +5,14 @@
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "ast/callback_visitor.h"
 #include "bpffeature.h"
 #include "bpforc.h"
 #include "bpftrace.h"
@@ -37,6 +39,12 @@ enum class OutputBufferConfig {
   FULL,
   NONE,
 };
+enum class TestMode
+{
+  UNSET = 0,
+  SEMANTIC,
+  CODEGEN,
+};
 } // namespace
 
 void usage()
@@ -53,6 +61,7 @@ void usage()
   std::cerr << "    -o file        redirect bpftrace output to file" << std::endl;
   std::cerr << "    -d             debug info dry run" << std::endl;
   std::cerr << "    -dd            verbose debug info dry run" << std::endl;
+  std::cerr << "    -b             force BTF (BPF type format) processing" << std::endl;
   std::cerr << "    -e 'program'   execute this program" << std::endl;
   std::cerr << "    -h, --help     show this help message" << std::endl;
   std::cerr << "    -I DIR         add the directory to the include search path" << std::endl;
@@ -63,6 +72,7 @@ void usage()
   std::cerr << "    --usdt-file-activation" << std::endl;
   std::cerr << "                   activate usdt semaphores based on file path" << std::endl;
   std::cerr << "    --unsafe       allow unsafe builtin functions" << std::endl;
+  std::cerr << "    -q             keep messages quiet" << std::endl;
   std::cerr << "    -v             verbose messages" << std::endl;
   std::cerr << "    --info         Print information about kernel BPF support" << std::endl;
   std::cerr << "    -k             emit a warning when a bpf helper returns an error (except read functions)" << std::endl;
@@ -158,6 +168,12 @@ static int info()
 #endif
   std::cerr << "  bcc_usdt_addsem: "
 #ifdef HAVE_BCC_USDT_ADDSEM
+            << "yes" << std::endl;
+#else
+            << "no" << std::endl;
+#endif
+  std::cerr << "  bcc bpf_attach_uprobe refcount: "
+#ifdef LIBBCC_ATTACH_UPROBE_SEVEN_ARGS_SIGNATURE
             << "yes" << std::endl;
 #else
             << "no" << std::endl;
@@ -259,13 +275,15 @@ int main(int argc, char *argv[])
   std::string cmd_str;
   bool listing = false;
   bool safe_mode = true;
+  bool force_btf = false;
   bool usdt_file_activation = false;
   int helper_check_level = 0;
+  TestMode test_mode = TestMode::UNSET;
   std::string script, search, file_name, output_file, output_format, output_elf;
   OutputBufferConfig obc = OutputBufferConfig::UNSET;
   int c;
 
-  const char* const short_options = "dbB:f:e:hlp:vc:Vo:I:k";
+  const char* const short_options = "dbB:f:e:hlp:vqc:Vo:I:k";
   option long_options[] = {
     option{ "help", no_argument, nullptr, 'h' },
     option{ "version", no_argument, nullptr, 'V' },
@@ -276,6 +294,7 @@ int main(int argc, char *argv[])
     option{ "info", no_argument, nullptr, 2000 },
     option{ "emit-elf", required_argument, nullptr, 2001 },
     option{ "no-warnings", no_argument, nullptr, 2002 },
+    option{ "test", required_argument, nullptr, 2003 },
     option{ nullptr, 0, nullptr, 0 }, // Must be last
   };
   std::vector<std::string> include_dirs;
@@ -296,6 +315,17 @@ int main(int argc, char *argv[])
       case 2002: // --no-warnings
         DISABLE_LOG(WARNING);
         break;
+      case 2003: // --test
+        if (std::strcmp(optarg, "semantic") == 0)
+          test_mode = TestMode::SEMANTIC;
+        else if (std::strcmp(optarg, "codegen") == 0)
+          test_mode = TestMode::CODEGEN;
+        else
+        {
+          LOG(ERROR) << "USAGE: --test must be either 'semantic' or 'codegen'.";
+          return 1;
+        }
+        break;
       case 'o':
         output_file = optarg;
         break;
@@ -305,6 +335,9 @@ int main(int argc, char *argv[])
           usage();
           return 1;
         }
+        break;
+      case 'q':
+        bt_quiet = true;
         break;
       case 'v':
         bt_verbose = true;
@@ -349,6 +382,7 @@ int main(int argc, char *argv[])
         safe_mode = false;
         break;
       case 'b':
+        force_btf = true;
         break;
       case 'h':
         usage();
@@ -432,6 +466,7 @@ int main(int argc, char *argv[])
 
   bpftrace.usdt_file_activation_ = usdt_file_activation;
   bpftrace.safe_mode_ = safe_mode;
+  bpftrace.force_btf_ = force_btf;
   bpftrace.helper_check_level_ = helper_check_level;
   bpftrace.boottime_ = get_boottime();
 
@@ -541,10 +576,6 @@ int main(int argc, char *argv[])
   // rlimit?
   enforce_infinite_rlimit();
 
-  // defaults
-  bpftrace.join_argnum_ = 16;
-  bpftrace.join_argsize_ = 1024;
-
   if (!get_uint64_env_var("BPFTRACE_STRLEN", bpftrace.strlen_))
     return 1;
 
@@ -588,6 +619,10 @@ int main(int argc, char *argv[])
     return 1;
 
   if (!get_uint64_env_var("BPFTRACE_PERF_RB_PAGES", bpftrace.perf_rb_pages_))
+    return 1;
+
+  if (!get_uint64_env_var("BPFTRACE_MAX_TYPE_RES_ITERATIONS",
+                          bpftrace.max_type_res_iterations))
     return 1;
 
   if (const char* env_p = std::getenv("BPFTRACE_CAT_BYTES_MAX"))
@@ -639,6 +674,10 @@ int main(int argc, char *argv[])
                                    !bpftrace.is_aslr_enabled(-1);
   }
 
+  uint64_t node_max = std::numeric_limits<uint64_t>::max();
+  if (!get_uint64_env_var("BPFTRACE_NODE_MAX", node_max))
+    return 1;
+
   if (!cmd_str.empty())
     bpftrace.cmd_ = cmd_str;
 
@@ -649,8 +688,8 @@ int main(int argc, char *argv[])
   {
     std::cout << "\nAST\n";
     std::cout << "-------------------\n";
-    ast::Printer p(std::cout);
-    driver.root_->accept(p);
+    ast::Printer printer(std::cout);
+    printer.print(driver.root_);
     std::cout << std::endl;
   }
 
@@ -695,8 +734,7 @@ int main(int argc, char *argv[])
   if (err)
     return err;
 
-  ast::SemanticAnalyser semantics(
-      driver.root_, bpftrace, bpftrace.feature_, !cmd_str.empty());
+  ast::SemanticAnalyser semantics(driver.root_, bpftrace, !cmd_str.empty());
   err = semantics.analyse();
   if (err)
     return err;
@@ -705,10 +743,29 @@ int main(int argc, char *argv[])
   {
     std::cout << "\nAST after semantic analysis\n";
     std::cout << "-------------------\n";
-    ast::Printer p(std::cout, true);
-    driver.root_->accept(p);
+    ast::Printer printer(std::cout, true);
+    printer.print(driver.root_);
     std::cout << std::endl;
   }
+
+  // Count AST nodes
+  uint64_t node_count = 0;
+  ast::CallbackVisitor counter(
+      [&](ast::Node* node __attribute__((unused))) { node_count += 1; });
+  driver.root_->accept(counter);
+  if (bt_verbose)
+  {
+    LOG(INFO) << "node count: " << node_count;
+  }
+  if (node_count >= node_max)
+  {
+    LOG(ERROR) << "node count (" << node_count << ") exceeds the limit ("
+               << node_max << ")";
+    return 1;
+  }
+
+  if (test_mode == TestMode::SEMANTIC)
+    return 0;
 
   err = semantics.create_maps(bt_debug != DebugLevel::kNone);
   if (err)
@@ -770,6 +827,9 @@ int main(int argc, char *argv[])
   if (bt_debug != DebugLevel::kNone)
     return 0;
 
+  if (test_mode == TestMode::CODEGEN)
+    return 0;
+
   // Signal handler that lets us know an exit signal was received.
   struct sigaction act = {};
   act.sa_handler = [](int) { BPFtrace::exitsig_recv = true; };
@@ -779,7 +839,8 @@ int main(int argc, char *argv[])
   uint64_t num_probes = bpftrace.num_probes();
   if (num_probes == 0)
   {
-    std::cout << "No probes to attach" << std::endl;
+    if (!bt_quiet)
+      std::cout << "No probes to attach" << std::endl;
     return 1;
   }
   else if (num_probes > bpftrace.max_probes_)
@@ -793,7 +854,7 @@ int main(int argc, char *argv[])
         << "attached can cause your system to crash.";
     return 1;
   }
-  else
+  else if (!bt_quiet)
     bpftrace.out_->attached_probes(num_probes);
 
   err = bpftrace.run(move(bpforc));

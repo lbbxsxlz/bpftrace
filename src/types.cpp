@@ -40,7 +40,7 @@ std::ostream &operator<<(std::ostream &os, const SizedType &type)
   }
   else if (type.IsIntTy())
   {
-    os << (type.is_signed_ ? "" : "unsigned ") << "int" << 8 * type.size;
+    os << (type.is_signed_ ? "" : "unsigned ") << "int" << 8 * type.GetSize();
   }
   else if (type.IsArrayTy())
   {
@@ -48,7 +48,7 @@ std::ostream &operator<<(std::ostream &os, const SizedType &type)
   }
   else if (type.IsStringTy() || type.IsBufferTy())
   {
-    os << type.type << "[" << type.size << "]";
+    os << type.type << "[" << type.GetSize() << "]";
   }
   else if (type.IsTupleTy())
   {
@@ -90,12 +90,13 @@ bool SizedType::IsEqual(const SizedType &t) const
     return false;
 
   if (IsRecordTy())
-    return t.GetName() == GetName() && t.size == size;
+    return t.GetName() == GetName() && t.GetSize() == GetSize();
 
   if (IsPtrTy())
     return *t.GetPointeeTy() == *GetPointeeTy();
 
-  return type == t.type && size == t.size && is_signed_ == t.is_signed_;
+  return type == t.type && GetSize() == t.GetSize() &&
+         is_signed_ == t.is_signed_;
 }
 
 bool SizedType::operator!=(const SizedType &t) const
@@ -234,14 +235,6 @@ std::string probetypeName(ProbeType t)
   return {}; // unreached
 }
 
-bool is_userspace_probe(const std::string &probe_name)
-{
-  auto probe_type = probetype(probe_name);
-  return (probe_type == ProbeType::uprobe && probe_name != "BEGIN" &&
-          probe_name != "END") ||
-         probe_type == ProbeType::uretprobe || probe_type == ProbeType::usdt;
-}
-
 uint64_t asyncactionint(AsyncAction a)
 {
   return (uint64_t)a;
@@ -257,7 +250,7 @@ SizedType CreateInteger(size_t bits, bool is_signed)
   assert(bits == 0 || bits == 1 || bits == 8 || bits == 16 || bits == 32 ||
          bits == 64);
   auto t = SizedType(Type::integer, bits / 8, is_signed);
-  t.size_bits = bits;
+  t.size_bits_ = bits;
   return t;
 }
 
@@ -335,7 +328,7 @@ SizedType CreateArray(size_t num_elements, const SizedType &element_type)
 {
   auto ty = SizedType(Type::array, num_elements);
   ty.num_elements_ = num_elements;
-  ty.element_type_ = new SizedType(element_type);
+  ty.element_type_ = std::make_shared<SizedType>(element_type);
   return ty;
 }
 
@@ -343,7 +336,7 @@ SizedType CreatePointer(const SizedType &pointee_type, AddrSpace as)
 {
   // Pointer itself is always an uint64
   auto ty = SizedType(Type::pointer, 8);
-  ty.element_type_ = new SizedType(pointee_type);
+  ty.element_type_ = std::make_shared<SizedType>(pointee_type);
   ty.SetAS(as);
   return ty;
 }
@@ -448,7 +441,7 @@ SizedType CreateTuple(const std::vector<SizedType> &fields)
 {
   auto s = SizedType(Type::tuple, 0);
   s.tuple_fields = Tuple::Create(fields);
-  s.size = s.tuple_fields->size;
+  s.size_ = s.tuple_fields->size;
   return s;
 }
 
@@ -491,9 +484,9 @@ ssize_t SizedType::GetAlignment() const
   if (IsTupleTy())
     return tuple_fields->align;
 
-  if (size <= 2)
-    return size;
-  else if (size <= 4)
+  if (GetSize() <= 2)
+    return GetSize();
+  else if (GetSize() <= 4)
     return 4;
   else
     return 8;

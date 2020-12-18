@@ -30,7 +30,7 @@ vspace   [\n\r]
 space    {hspace}|{vspace}
 path     :(\\.|[_\-\./a-zA-Z0-9#\*])*:
 builtin  arg[0-9]|args|cgroup|comm|cpid|cpu|ctx|curtask|elapsed|func|gid|nsecs|pid|probe|rand|retval|sarg[0-9]|tid|uid|username
-call     avg|buf|cat|cgroupid|clear|count|delete|exit|hist|join|kaddr|kptr|ksym|lhist|max|min|ntop|override|print|printf|reg|signal|sizeof|stats|str|strftime|strncmp|sum|system|time|uaddr|uptr|usym|zero
+call     avg|buf|cat|cgroupid|clear|count|delete|exit|hist|join|kaddr|kptr|ksym|lhist|max|min|ntop|override|print|printf|reg|signal|sizeof|stats|str|strftime|strncmp|sum|system|time|uaddr|uptr|usym|zero|path
 
 /* Don't add to this! Use builtin OR call not both */
 call_and_builtin kstack|ustack
@@ -59,8 +59,16 @@ bpftrace|perf           { return Parser::make_STACK_MODE(yytext, loc); }
 {builtin}               { return Parser::make_BUILTIN(yytext, loc); }
 {call}                  { return Parser::make_CALL(yytext, loc); }
 {call_and_builtin}      { return Parser::make_CALL_BUILTIN(yytext, loc); }
-{int}                   { return Parser::make_INT(strtoll(yytext, NULL, 0), loc); }
-{exponent}              { return Parser::make_INT(parse_exponent(yytext), loc); }
+{int}                   { return Parser::make_INT(strtoul(yytext, NULL, 0), loc); }
+{exponent}              {
+                          uint64_t num;
+                          try {
+                            num = parse_exponent(yytext);
+                            return Parser::make_INT(num, loc);
+                          } catch (std::exception const &e) {
+                            driver.error(loc, e.what());
+                          }
+                        }
 {path}                  { return Parser::make_PATH(yytext, loc); }
 {map}                   { return Parser::make_MAP(yytext, loc); }
 {var}                   { return Parser::make_VAR(yytext, loc); }

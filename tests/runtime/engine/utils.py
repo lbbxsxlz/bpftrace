@@ -65,7 +65,9 @@ class Utils(object):
         elif status == Utils.SKIP_REQUIREMENT_UNSATISFIED:
             return "unmet condition: '%s'" % test.requirement
         elif status == Utils.SKIP_FEATURE_REQUIREMENT_UNSATISFIED:
-            return "missed feature: '%s'" % ','.join(test.feature_requirement)
+            neg_reqs = { "!{}".format(f) for f in test.neg_feature_requirement }
+            return "missed feature: '%s'" % ','.join(
+                (neg_reqs | test.feature_requirement))
         elif status == Utils.SKIP_ENVIRONMENT_DISABLED:
             return "disabled by environment variable"
         else:
@@ -98,6 +100,9 @@ class Utils(object):
         bpffeature["loop"] = output.find("Loop support: yes") != -1
         bpffeature["probe_read_kernel"] = output.find("probe_read_kernel: yes") != -1
         bpffeature["btf"] = output.find("btf (depends on Build:libbpf): yes") != -1
+        bpffeature["dpath"] = output.find("dpath: yes") != -1
+        bpffeature["uprobe_refcount"] = \
+            output.find("uprobe refcount (depends on Build:bcc bpf_attach_uprobe refcount): yes") != -1
         return bpffeature
 
     @staticmethod
@@ -131,12 +136,21 @@ class Utils(object):
                         print(warn("[   SKIP   ] ") + "%s.%s" % (test.suite, test.name))
                         return Utils.SKIP_REQUIREMENT_UNSATISFIED
 
-            if test.feature_requirement:
+            if test.feature_requirement or test.neg_feature_requirement:
                 bpffeature = Utils.__get_bpffeature()
+
                 for feature in test.feature_requirement:
                     if feature not in bpffeature:
                         raise ValueError("Invalid feature requirement: %s" % feature)
                     elif not bpffeature[feature]:
+                        print(warn("[   SKIP   ] ") + "%s.%s" % (test.suite, test.name))
+                        return Utils.SKIP_FEATURE_REQUIREMENT_UNSATISFIED
+
+                for feature in test.neg_feature_requirement:
+                    if feature not in bpffeature:
+                        raise ValueError("Invalid feature requirement: %s" % feature)
+                    elif bpffeature[feature]:
+                        print(warn("[   SKIP   ] ") + "%s.%s" % (test.suite, test.name))
                         return Utils.SKIP_FEATURE_REQUIREMENT_UNSATISFIED
 
             if test.before:
@@ -147,13 +161,16 @@ class Utils(object):
                     # a test program needs to accept arguments. It covers the
                     # current simple calls with no arguments
                     child_name = os.path.basename(test.before.split()[-1])
-                    while subprocess.call(["pidof", child_name], stdout=dn, stderr=dn) != 0:
+                    while subprocess.call(["pidof", "-s", child_name], stdout=dn, stderr=dn) != 0:
                         time.sleep(0.1)
                         waited+=0.1
                         if waited > test.timeout:
                             raise TimeoutError('Timed out waiting for BEFORE %s ', test.before)
 
             bpf_call = Utils.prepare_bpf_call(test)
+            if test.before:
+                childpid = subprocess.Popen(["pidof", "-s", child_name], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].strip()
+                bpf_call = re.sub("{{BEFORE_PID}}", str(childpid), bpf_call)
             env = {'test': test.name}
             env.update(test.env)
             p = subprocess.Popen(

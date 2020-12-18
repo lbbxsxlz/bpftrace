@@ -40,7 +40,7 @@ public:
     {
       return -1;
     }
-    else if (name[0] > 'A' && name[0] < 'z')
+    else if (name[0] >= 'A' && name[0] <= 'z')
     {
       sym->address = 12345;
       sym->size = 4;
@@ -68,7 +68,11 @@ public:
     has_override_return_ = std::make_optional<bool>(has_features);
     prog_kfunc_ = std::make_optional<bool>(has_features);
     has_loop_ = std::make_optional<bool>(has_features);
+    has_probe_read_kernel_ = std::make_optional<bool>(has_features);
+    has_features_ = has_features;
+    has_d_path_ = std::make_optional<bool>(has_features);
   };
+  bool has_features_;
 };
 
 class MockChildProc : public ChildProcBase

@@ -76,7 +76,7 @@ void CodegenLLVM::visit(PositionalParameter &param)
           AllocaInst *buf = b_.CreateAllocaBPF(ArrayType::get(b_.getInt8Ty(), pstr.length() + 1), "str");
           b_.CREATE_MEMSET(buf, b_.getInt8(0), pstr.length() + 1, 1);
           b_.CreateStore(const_str, buf);
-          expr_ = buf;
+          expr_ = b_.CreatePtrToInt(buf, b_.getInt64Ty());
           expr_deleter_ = [this, buf]() { b_.CreateLifetimeEnd(buf); };
         }
       }
@@ -89,7 +89,7 @@ void CodegenLLVM::visit(PositionalParameter &param)
 
 void CodegenLLVM::visit(String &string)
 {
-  string.str.resize(string.type.size-1);
+  string.str.resize(string.type.GetSize() - 1);
   Constant *const_str = ConstantDataArray::getString(module_->getContext(), string.str, true);
   AllocaInst *buf = b_.CreateAllocaBPF(string.type, "str");
   b_.CreateStore(const_str, buf);
@@ -115,7 +115,7 @@ void CodegenLLVM::visit(Builtin &builtin)
 {
   if (builtin.ident == "nsecs")
   {
-    expr_ = b_.CreateGetNs(bpftrace_.feature_.has_helper_ktime_get_boot_ns());
+    expr_ = b_.CreateGetNs(bpftrace_.feature_->has_helper_ktime_get_boot_ns());
   }
   else if (builtin.ident == "elapsed")
   {
@@ -126,7 +126,7 @@ void CodegenLLVM::visit(Builtin &builtin)
     auto type = CreateUInt64();
     auto start = b_.CreateMapLookupElem(
         ctx_, map->mapfd_, key, type, builtin.loc);
-    expr_ = b_.CreateGetNs(bpftrace_.feature_.has_helper_ktime_get_boot_ns());
+    expr_ = b_.CreateGetNs(bpftrace_.feature_->has_helper_ktime_get_boot_ns());
     expr_ = b_.CreateSub(expr_, start);
     // start won't be on stack, no need to LifeTimeEnd it
     b_.CreateLifetimeEnd(key);
@@ -191,8 +191,8 @@ void CodegenLLVM::visit(Builtin &builtin)
   {
     AllocaInst *buf = b_.CreateAllocaBPF(builtin.type, "comm");
     // initializing memory needed for older kernels:
-    b_.CREATE_MEMSET(buf, b_.getInt8(0), builtin.type.size, 1);
-    b_.CreateGetCurrentComm(ctx_, buf, builtin.type.size, builtin.loc);
+    b_.CREATE_MEMSET(buf, b_.getInt8(0), builtin.type.GetSize(), 1);
+    b_.CreateGetCurrentComm(ctx_, buf, builtin.type.GetSize(), builtin.loc);
     expr_ = buf;
     expr_deleter_ = [this, buf]() { b_.CreateLifetimeEnd(buf); };
   }
@@ -222,7 +222,7 @@ void CodegenLLVM::visit(Builtin &builtin)
                                           arg_num,
                                           builtin,
                                           bpftrace_.pid(),
-                                          AddrSpace::none,
+                                          AddrSpace::user,
                                           builtin.loc);
         return;
       }
@@ -459,10 +459,10 @@ void CodegenLLVM::visit(Call &call)
     auto scoped_del = accept(call.vargs->front());
 
     // prepare arguments
-    Integer *value_arg = static_cast<Integer *>(call.vargs->at(0));
-    Integer *min_arg = static_cast<Integer *>(call.vargs->at(1));
-    Integer *max_arg = static_cast<Integer *>(call.vargs->at(2));
-    Integer *step_arg = static_cast<Integer *>(call.vargs->at(3));
+    auto *value_arg = call.vargs->at(0);
+    auto *min_arg = call.vargs->at(1);
+    auto *max_arg = call.vargs->at(2);
+    auto *step_arg = call.vargs->at(3);
     Value *value, *min, *max, *step;
     auto scoped_del_value_arg = accept(value_arg);
     value = expr_;
@@ -561,7 +561,7 @@ void CodegenLLVM::visit(Call &call)
     {
       auto &arg = *call.vargs->at(0);
       fixed_buffer_length = arg.type.GetNumElements() *
-                            arg.type.GetElementTy()->size;
+                            arg.type.GetElementTy()->GetSize();
       length = b_.getInt8(fixed_buffer_length);
     }
 
@@ -587,13 +587,26 @@ void CodegenLLVM::visit(Call &call)
 
     auto scoped_del = accept(call.vargs->front());
     auto arg0 = call.vargs->front();
+    // arg0 is already on the bpf stack -> use probe kernel
+    // otherwise ->  addrspace of arg0->type
+    // case : struct MyStruct { char b[4]; };
+    // $s = (struct MyStruct *)arg0; buf($s->b, 4)
     b_.CreateProbeRead(ctx_,
                        static_cast<AllocaInst *>(buf_data_offset),
                        length,
                        expr_,
-                       arg0->type.GetAS(),
+                       find_addrspace_stack(arg0->type),
                        call.loc);
 
+    expr_ = buf;
+    expr_deleter_ = [this, buf]() { b_.CreateLifetimeEnd(buf); };
+  }
+  else if (call.func == "path")
+  {
+    AllocaInst *buf = b_.CreateAllocaBPF(bpftrace_.strlen_, "path");
+    b_.CREATE_MEMSET(buf, b_.getInt8(0), bpftrace_.strlen_, 1);
+    call.vargs->front()->accept(*this);
+    b_.CreatePath(ctx_, buf, expr_, call.loc);
     expr_ = buf;
     expr_deleter_ = [this, buf]() { b_.CreateLifetimeEnd(buf); };
   }
@@ -724,7 +737,7 @@ void CodegenLLVM::visit(Call &call)
     auto inet = call.vargs->at(0);
     if (call.vargs->size() == 1)
     {
-      if (inet->type.IsIntegerTy() || inet->type.size == 4)
+      if (inet->type.IsIntegerTy() || inet->type.GetSize() == 4)
       {
         af_type = b_.getInt64(AF_INET);
       }
@@ -749,7 +762,7 @@ void CodegenLLVM::visit(Call &call)
     {
       b_.CreateProbeRead(ctx_,
                          static_cast<AllocaInst *>(inet_offset),
-                         inet->type.size,
+                         inet->type.GetSize(),
                          expr_,
                          inet->type.GetAS(),
                          call.loc);
@@ -934,7 +947,7 @@ void CodegenLLVM::visit(Call &call)
   }
   else if (call.func == "sizeof")
   {
-    expr_ = b_.getInt64(call.vargs->at(0)->type.size);
+    expr_ = b_.getInt64(call.vargs->at(0)->type.GetSize());
   }
   else if (call.func == "strncmp") {
     uint64_t size = static_cast<Integer *>(call.vargs->at(2))->n;
@@ -1020,6 +1033,194 @@ void CodegenLLVM::visit(Variable &var)
   }
 }
 
+void CodegenLLVM::binop_string(Binop &binop)
+{
+  if (binop.op != bpftrace::Parser::token::EQ &&
+      binop.op != bpftrace::Parser::token::NE)
+  {
+    LOG(FATAL) << "missing codegen to string operator \"" << opstr(binop)
+               << "\"";
+  }
+
+  std::string string_literal;
+
+  // strcmp returns 0 when strings are equal
+  bool inverse = binop.op == bpftrace::Parser::token::EQ;
+
+  auto left_as = binop.left->type.GetAS();
+  auto right_as = binop.right->type.GetAS();
+
+  // If one of the strings is fixed, we can avoid storing the
+  // literal in memory by calling a different function.
+  if (binop.right->is_literal)
+  {
+    auto scoped_del = accept(binop.left);
+    string_literal = bpftrace_.get_string_literal(binop.right);
+    expr_ = b_.CreateStrcmp(
+        ctx_, expr_, left_as, string_literal, binop.loc, inverse);
+  }
+  else if (binop.left->is_literal)
+  {
+    auto scoped_del = accept(binop.right);
+    string_literal = bpftrace_.get_string_literal(binop.left);
+    expr_ = b_.CreateStrcmp(
+        ctx_, expr_, right_as, string_literal, binop.loc, inverse);
+  }
+  else
+  {
+    auto scoped_del_right = accept(binop.right);
+    Value *right_string = expr_;
+
+    auto scoped_del_left = accept(binop.left);
+    Value *left_string = expr_;
+
+    size_t len = std::min(binop.left->type.GetSize(),
+                          binop.right->type.GetSize());
+    expr_ = b_.CreateStrncmp(ctx_,
+                             left_string,
+                             left_as,
+                             right_string,
+                             right_as,
+                             len + 1,
+                             binop.loc,
+                             inverse);
+  }
+}
+
+void CodegenLLVM::binop_buf(Binop &binop)
+{
+  if (binop.op != bpftrace::Parser::token::EQ &&
+      binop.op != bpftrace::Parser::token::NE)
+  {
+    LOG(FATAL) << "missing codegen to buffer operator \"" << opstr(binop)
+               << "\"";
+  }
+
+  std::string string_literal("");
+
+  // strcmp returns 0 when strings are equal
+  bool inverse = binop.op == bpftrace::Parser::token::EQ;
+
+  auto scoped_del_right = accept(binop.right);
+  Value *right_string = expr_;
+  auto right_as = binop.right->type.GetAS();
+
+  auto scoped_del_left = accept(binop.left);
+  Value *left_string = expr_;
+  auto left_as = binop.left->type.GetAS();
+
+  size_t len = std::min(binop.left->type.GetSize(),
+                        binop.right->type.GetSize());
+  expr_ = b_.CreateStrncmp(ctx_,
+                           left_string,
+                           left_as,
+                           right_string,
+                           right_as,
+                           len,
+                           binop.loc,
+                           inverse);
+}
+
+void CodegenLLVM::binop_int(Binop &binop)
+{
+  Value *lhs, *rhs;
+  auto scoped_del_left = accept(binop.left);
+  lhs = expr_;
+  auto scoped_del_right = accept(binop.right);
+  rhs = expr_;
+
+  // If left or right is PositionalParameter, that means the syntax is
+  // str($1 + num) or str(num + $1). The positional params returns a pointer
+  // to a buffer, and the buffer should live untill str() is accepted.
+  // Extend the liftime of the buffer
+  if (dynamic_cast<PositionalParameter *>(binop.left))
+    expr_deleter_ = scoped_del_left.disarm();
+  if (dynamic_cast<PositionalParameter *>(binop.right))
+    expr_deleter_ = scoped_del_right.disarm();
+
+  bool lsign = binop.left->type.IsSigned();
+  bool rsign = binop.right->type.IsSigned();
+  bool do_signed = lsign && rsign;
+  // promote int to 64-bit
+  lhs = b_.CreateIntCast(lhs, b_.getInt64Ty(), lsign);
+  rhs = b_.CreateIntCast(rhs, b_.getInt64Ty(), rsign);
+
+  switch (binop.op)
+  {
+    case bpftrace::Parser::token::EQ:
+      expr_ = b_.CreateICmpEQ(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::NE:
+      expr_ = b_.CreateICmpNE(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::LE:
+    {
+      expr_ = do_signed ? b_.CreateICmpSLE(lhs, rhs)
+                        : b_.CreateICmpULE(lhs, rhs);
+      break;
+    }
+    case bpftrace::Parser::token::GE:
+    {
+      expr_ = do_signed ? b_.CreateICmpSGE(lhs, rhs)
+                        : b_.CreateICmpUGE(lhs, rhs);
+      break;
+    }
+    case bpftrace::Parser::token::LT:
+    {
+      expr_ = do_signed ? b_.CreateICmpSLT(lhs, rhs)
+                        : b_.CreateICmpULT(lhs, rhs);
+      break;
+    }
+    case bpftrace::Parser::token::GT:
+    {
+      expr_ = do_signed ? b_.CreateICmpSGT(lhs, rhs)
+                        : b_.CreateICmpUGT(lhs, rhs);
+      break;
+    }
+    case bpftrace::Parser::token::LEFT:
+      expr_ = b_.CreateShl(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::RIGHT:
+      expr_ = b_.CreateLShr(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::PLUS:
+      expr_ = b_.CreateAdd(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::MINUS:
+      expr_ = b_.CreateSub(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::MUL:
+      expr_ = b_.CreateMul(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::DIV:
+      expr_ = b_.CreateUDiv(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::MOD:
+    {
+      // Always do an unsigned modulo operation here even if `do_signed`
+      // is true. bpf instruction set does not support signed division.
+      // We already warn in the semantic analyser that signed modulo can
+      // lead to undefined behavior (because we will treat it as unsigned).
+      expr_ = b_.CreateURem(lhs, rhs);
+      break;
+    }
+    case bpftrace::Parser::token::BAND:
+      expr_ = b_.CreateAnd(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::BOR:
+      expr_ = b_.CreateOr(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::BXOR:
+      expr_ = b_.CreateXor(lhs, rhs);
+      break;
+    case bpftrace::Parser::token::LAND:
+    case bpftrace::Parser::token::LOR:
+      LOG(FATAL) << "\"" << opstr(binop) << "\" was handled earlier";
+  }
+  // Using signed extension will result in -1 which will likely confuse users
+  expr_ = b_.CreateIntCast(expr_, b_.getInt64Ty(), false);
+}
+
 void CodegenLLVM::visit(Binop &binop)
 {
   // Handle && and || separately so short circuiting works
@@ -1037,145 +1238,16 @@ void CodegenLLVM::visit(Binop &binop)
   SizedType &type = binop.left->type;
   if (type.IsStringTy())
   {
-
-    if (binop.op != bpftrace::Parser::token::EQ && binop.op != bpftrace::Parser::token::NE) {
-      LOG(FATAL) << "missing codegen to string operator \"" << opstr(binop)
-                 << "\"";
-    }
-
-    std::string string_literal;
-
-    // strcmp returns 0 when strings are equal
-    bool inverse = binop.op == bpftrace::Parser::token::EQ;
-
-    auto left_as = binop.left->type.GetAS();
-    auto right_as = binop.right->type.GetAS();
-
-    // If one of the strings is fixed, we can avoid storing the
-    // literal in memory by calling a different function.
-    if (binop.right->is_literal)
-    {
-      auto scoped_del = accept(binop.left);
-      string_literal = bpftrace_.get_string_literal(binop.right);
-      expr_ = b_.CreateStrcmp(
-          ctx_, expr_, left_as, string_literal, binop.loc, inverse);
-    }
-    else if (binop.left->is_literal)
-    {
-      auto scoped_del = accept(binop.right);
-      string_literal = bpftrace_.get_string_literal(binop.left);
-      expr_ = b_.CreateStrcmp(
-          ctx_, expr_, right_as, string_literal, binop.loc, inverse);
-    }
-    else
-    {
-      auto scoped_del_right = accept(binop.right);
-      Value * right_string = expr_;
-
-      auto scoped_del_left = accept(binop.left);
-      Value * left_string = expr_;
-
-      size_t len = std::min(binop.left->type.size, binop.right->type.size);
-      expr_ = b_.CreateStrncmp(ctx_,
-                               left_string,
-                               left_as,
-                               right_string,
-                               right_as,
-                               len + 1,
-                               binop.loc,
-                               inverse);
-    }
+    binop_string(binop);
   }
   else if (type.IsBufferTy())
   {
-    if (binop.op != bpftrace::Parser::token::EQ &&
-        binop.op != bpftrace::Parser::token::NE)
-    {
-      LOG(FATAL) << "missing codegen to buffer operator \"" << opstr(binop)
-                 << "\"";
-    }
-
-    std::string string_literal("");
-
-    // strcmp returns 0 when strings are equal
-    bool inverse = binop.op == bpftrace::Parser::token::EQ;
-
-    auto scoped_del_right = accept(binop.right);
-    Value *right_string = expr_;
-    auto right_as = binop.right->type.GetAS();
-
-    auto scoped_del_left = accept(binop.left);
-    Value *left_string = expr_;
-    auto left_as = binop.left->type.GetAS();
-
-    size_t len = std::min(binop.left->type.size, binop.right->type.size);
-    expr_ = b_.CreateStrncmp(ctx_,
-                             left_string,
-                             left_as,
-                             right_string,
-                             right_as,
-                             len,
-                             binop.loc,
-                             inverse);
+    binop_buf(binop);
   }
   else
   {
-    Value *lhs, *rhs;
-    auto scoped_del_left = accept(binop.left);
-    lhs = expr_;
-    auto scoped_del_right = accept(binop.right);
-    rhs = expr_;
-
-    bool lsign = binop.left->type.IsSigned();
-    bool rsign = binop.right->type.IsSigned();
-    bool do_signed = lsign && rsign;
-    // promote int to 64-bit
-    lhs = b_.CreateIntCast(lhs, b_.getInt64Ty(), lsign);
-    rhs = b_.CreateIntCast(rhs, b_.getInt64Ty(), rsign);
-
-    switch (binop.op) {
-      case bpftrace::Parser::token::EQ:    expr_ = b_.CreateICmpEQ (lhs, rhs); break;
-      case bpftrace::Parser::token::NE:    expr_ = b_.CreateICmpNE (lhs, rhs); break;
-      case bpftrace::Parser::token::LE: {
-        expr_ = do_signed ? b_.CreateICmpSLE(lhs, rhs) : b_.CreateICmpULE(lhs, rhs);
-        break;
-      }
-      case bpftrace::Parser::token::GE: {
-        expr_ = do_signed ? b_.CreateICmpSGE(lhs, rhs) : b_.CreateICmpUGE(lhs, rhs);
-        break;
-      }
-      case bpftrace::Parser::token::LT: {
-        expr_ = do_signed ? b_.CreateICmpSLT(lhs, rhs) : b_.CreateICmpULT(lhs, rhs);
-        break;
-      }
-      case bpftrace::Parser::token::GT: {
-        expr_ = do_signed ? b_.CreateICmpSGT(lhs, rhs) : b_.CreateICmpUGT(lhs, rhs);
-        break;
-      }
-      case bpftrace::Parser::token::LEFT:  expr_ = b_.CreateShl    (lhs, rhs); break;
-      case bpftrace::Parser::token::RIGHT: expr_ = b_.CreateLShr   (lhs, rhs); break;
-      case bpftrace::Parser::token::PLUS:  expr_ = b_.CreateAdd    (lhs, rhs); break;
-      case bpftrace::Parser::token::MINUS: expr_ = b_.CreateSub    (lhs, rhs); break;
-      case bpftrace::Parser::token::MUL:   expr_ = b_.CreateMul    (lhs, rhs); break;
-      case bpftrace::Parser::token::DIV:   expr_ = b_.CreateUDiv   (lhs, rhs); break;
-      case bpftrace::Parser::token::MOD: {
-        // Always do an unsigned modulo operation here even if `do_signed`
-        // is true. bpf instruction set does not support signed division.
-        // We already warn in the semantic analyser that signed modulo can
-        // lead to undefined behavior (because we will treat it as unsigned).
-        expr_ = b_.CreateURem(lhs, rhs);
-        break;
-      }
-      case bpftrace::Parser::token::BAND:  expr_ = b_.CreateAnd    (lhs, rhs); break;
-      case bpftrace::Parser::token::BOR:   expr_ = b_.CreateOr     (lhs, rhs); break;
-      case bpftrace::Parser::token::BXOR:  expr_ = b_.CreateXor    (lhs, rhs); break;
-      case bpftrace::Parser::token::LAND:
-      case bpftrace::Parser::token::LOR:
-        LOG(FATAL) << "\"" << opstr(binop) << "\" was handled earlier";
-    }
+    binop_int(binop);
   }
-  // Using signed extension will result in -1 which will likely confuse users
-  expr_ = b_.CreateIntCast(expr_, b_.getInt64Ty(), false);
 }
 
 static bool unop_skip_accept(Unop &unop)
@@ -1262,14 +1334,13 @@ void CodegenLLVM::visit(Unop &unop)
       }
       case bpftrace::Parser::token::MUL:
       {
-        int size = type.size;
-        if (type.IsPtrTy())
-        {
-          // When dereferencing a 32-bit integer, only read in 32-bits, etc.
-          size = type.GetPointeeTy()->size;
-        }
+        // When dereferencing a 32-bit integer, only read in 32-bits, etc.
+        int size = type.IsPtrTy() ? type.GetPointeeTy()->GetSize()
+                                  : type.GetSize();
+        auto as =  type.GetAS();
+
         AllocaInst *dst = b_.CreateAllocaBPF(SizedType(type.type, size), "deref");
-        b_.CreateProbeRead(ctx_, dst, size, expr_, type.GetAS(), unop.loc);
+        b_.CreateProbeRead(ctx_, dst, size, expr_, as, unop.loc);
         expr_ = b_.CreateIntCast(b_.CreateLoad(dst),
                                  b_.getInt64Ty(),
                                  type.IsSigned());
@@ -1284,10 +1355,11 @@ void CodegenLLVM::visit(Unop &unop)
     {
       case bpftrace::Parser::token::MUL:
       {
-        if (unop.type.IsIntegerTy())
+        if (unop.type.IsIntegerTy() || unop.type.IsPtrTy())
         {
           auto *et = type.GetPointeeTy();
-          int size = et->GetIntBitWidth() / 8;
+          // Pointer always 64 bits wide
+          int size = unop.type.IsIntegerTy() ? et->GetIntBitWidth() / 8 : 8;
           AllocaInst *dst = b_.CreateAllocaBPF(*et, "deref");
           b_.CreateProbeRead(ctx_, dst, size, expr_, type.GetAS(), unop.loc);
           expr_ = b_.CreateIntCast(b_.CreateLoad(dst),
@@ -1355,12 +1427,12 @@ void CodegenLLVM::visit(Ternary &ternary)
     // copy selected string via CreateMemCpy
     b_.SetInsertPoint(left_block);
     auto scoped_del_left = accept(ternary.left);
-    b_.CREATE_MEMCPY(buf, expr_, ternary.type.size, 1);
+    b_.CREATE_MEMCPY(buf, expr_, ternary.type.GetSize(), 1);
     b_.CreateBr(done);
 
     b_.SetInsertPoint(right_block);
     auto scoped_del_right = accept(ternary.right);
-    b_.CREATE_MEMCPY(buf, expr_, ternary.type.size, 1);
+    b_.CREATE_MEMCPY(buf, expr_, ternary.type.GetSize(), 1);
     b_.CreateBr(done);
 
     b_.SetInsertPoint(done);
@@ -1388,6 +1460,7 @@ void CodegenLLVM::visit(Ternary &ternary)
 void CodegenLLVM::visit(FieldAccess &acc)
 {
   SizedType &type = acc.expr->type;
+  AddrSpace addrspace = acc.expr->type.GetAS();
   assert(type.IsRecordTy() || type.IsTupleTy());
   auto scoped_del = accept(acc.expr);
 
@@ -1430,6 +1503,9 @@ void CodegenLLVM::visit(FieldAccess &acc)
   type.is_tparg = is_tparg;
   type.is_internal = is_internal;
   type.is_kfarg = is_kfarg;
+  // Restore the addrspace info
+  // struct MyStruct { const int* a; };  $s = (struct MyStruct *)arg0;  $s->a
+  type.SetAS(addrspace);
 
   auto &field = cstruct.fields[acc.field];
 
@@ -1446,7 +1522,7 @@ void CodegenLLVM::visit(FieldAccess &acc)
       AllocaInst *dst = b_.CreateAllocaBPF(field.type,
                                            "internal_" + type.GetName() + "." +
                                                acc.field);
-      b_.CREATE_MEMCPY(dst, src, field.type.size, 1);
+      b_.CREATE_MEMCPY(dst, src, field.type.GetSize(), 1);
       expr_ = dst;
       expr_deleter_ = [this, dst]() { b_.CreateLifetimeEnd(dst); };
     }
@@ -1507,13 +1583,13 @@ void CodegenLLVM::visit(FieldAccess &acc)
         b_.CREATE_MEMCPY_VOLATILE(dst,
                                   b_.CreateIntToPtr(src,
                                                     field_ty->getPointerTo()),
-                                  field.type.size,
+                                  field.type.GetSize(),
                                   1);
       }
       else
       {
         b_.CreateProbeRead(
-            ctx_, dst, field.type.size, src, type.GetAS(), acc.loc);
+            ctx_, dst, field.type.GetSize(), src, type.GetAS(), acc.loc);
       }
       expr_ = dst;
       expr_deleter_ = [this, dst]() { b_.CreateLifetimeEnd(dst); };
@@ -1529,13 +1605,20 @@ void CodegenLLVM::visit(FieldAccess &acc)
         AllocaInst *dst = b_.CreateAllocaBPF(field.type,
                                              type.GetName() + "." + acc.field);
         // memset so verifier doesn't complain about reading uninitialized stack
-        b_.CREATE_MEMSET(dst, b_.getInt8(0), field.type.size, 1);
+        b_.CREATE_MEMSET(dst, b_.getInt8(0), field.type.GetSize(), 1);
         b_.CreateProbeRead(
             ctx_, dst, field.bitfield.read_bytes, src, type.GetAS(), acc.loc);
         raw = b_.CreateLoad(dst);
         b_.CreateLifetimeEnd(dst);
       }
-      Value *shifted = b_.CreateLShr(raw, field.bitfield.access_rshift);
+      size_t rshiftbits;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+      rshiftbits = field.bitfield.access_rshift;
+#else
+      rshiftbits = (field.type.GetSize() - field.bitfield.read_bytes) * 8;
+      rshiftbits += field.bitfield.access_rshift;
+#endif
+      Value *shifted = b_.CreateLShr(raw, rshiftbits);
       Value *masked = b_.CreateAnd(shifted, field.bitfield.mask);
       expr_ = masked;
     }
@@ -1572,7 +1655,7 @@ void CodegenLLVM::visit(FieldAccess &acc)
       AllocaInst *dst = b_.CreateAllocaBPF(field.type,
                                            type.GetName() + "." + acc.field);
       b_.CreateProbeRead(
-          ctx_, dst, field.type.size, src, type.GetAS(), acc.loc);
+          ctx_, dst, field.type.GetSize(), src, type.GetAS(), acc.loc);
       expr_ = b_.CreateIntCast(b_.CreateLoad(dst),
                                b_.getInt64Ty(),
                                field.type.IsSigned());
@@ -1585,7 +1668,7 @@ void CodegenLLVM::visit(ArrayAccess &arr)
 {
   Value *array, *index, *offset;
   SizedType &type = arr.expr->type;
-  size_t element_size = type.GetElementTy()->size;
+  size_t element_size = type.GetElementTy()->GetSize();
 
   auto scoped_del_expr = accept(arr.expr);
   array = expr_;
@@ -1630,8 +1713,10 @@ void CodegenLLVM::visit(Cast &cast)
   auto scoped_del = accept(cast.expr);
   if (cast.type.IsIntTy())
   {
-    expr_ = b_.CreateIntCast(
-        expr_, b_.getIntNTy(8 * cast.type.size), cast.type.IsSigned(), "cast");
+    expr_ = b_.CreateIntCast(expr_,
+                             b_.getIntNTy(8 * cast.type.GetSize()),
+                             cast.type.IsSigned(),
+                             "cast");
   }
 }
 
@@ -1646,7 +1731,7 @@ void CodegenLLVM::compareStructure(SizedType &our_type, llvm::Type *llvm_type)
   // But offset is only used for printing, so we can recover
   // from that by storing the correct offset.
   //
-  size_t our_size = our_type.size;
+  size_t our_size = our_type.GetSize();
   size_t llvm_size = layout_.getTypeAllocSize(llvm_type);
 
   if (llvm_size != our_size)
@@ -1692,7 +1777,7 @@ void CodegenLLVM::visit(Tuple &tuple)
     Value *dst = b_.CreateGEP(buf, { b_.getInt32(0), b_.getInt32(i) });
 
     if (shouldBeOnStackAlready(elem->type))
-      b_.CREATE_MEMCPY(dst, expr_, elem->type.size, 1);
+      b_.CREATE_MEMCPY(dst, expr_, elem->type.GetSize(), 1);
     else
       b_.CreateStore(expr_, dst);
   }
@@ -1735,7 +1820,7 @@ void CodegenLLVM::visit(AssignMapStatement &assignment)
       AllocaInst *dst = b_.CreateAllocaBPF(map.type, map.ident + "_val");
       b_.CreateProbeRead(ctx_,
                          dst,
-                         map.type.size,
+                         map.type.GetSize(),
                          expr,
                          assignment.expr->type.GetAS(),
                          assignment.loc);
@@ -1783,7 +1868,7 @@ void CodegenLLVM::visit(AssignVarStatement &assignment)
 
   if (needMemcpy(var.type))
   {
-    b_.CREATE_MEMCPY(variables_[var.ident], expr_, var.type.size, 1);
+    b_.CREATE_MEMCPY(variables_[var.ident], expr_, var.type.GetSize(), 1);
   }
   else
   {
@@ -2179,7 +2264,7 @@ AllocaInst *CodegenLLVM::getMapKey(Map &map)
       }
       else
       {
-        key = b_.CreateAllocaBPF(expr->type.size, map.ident + "_key");
+        key = b_.CreateAllocaBPF(expr->type.GetSize(), map.ident + "_key");
         b_.CreateStore(
             b_.CreateIntCast(expr_, b_.getInt64Ty(), expr->type.IsSigned()),
             b_.CreatePointerCast(key, expr_->getType()->getPointerTo()));
@@ -2191,7 +2276,7 @@ AllocaInst *CodegenLLVM::getMapKey(Map &map)
       size_t size = 0;
       for (Expression *expr : *map.vargs)
       {
-        size += expr->type.size;
+        size += expr->type.GetSize();
       }
       key = b_.CreateAllocaBPF(size, map.ident + "_key");
 
@@ -2204,7 +2289,7 @@ AllocaInst *CodegenLLVM::getMapKey(Map &map)
             key, { b_.getInt64(0), b_.getInt64(offset) });
 
         if (shouldBeOnStackAlready(expr->type))
-          b_.CREATE_MEMCPY(offset_val, expr_, expr->type.size, 1);
+          b_.CREATE_MEMCPY(offset_val, expr_, expr->type.GetSize(), 1);
         else
         {
           // promote map key to 64-bit:
@@ -2213,7 +2298,7 @@ AllocaInst *CodegenLLVM::getMapKey(Map &map)
               b_.CreatePointerCast(offset_val,
                                    expr_->getType()->getPointerTo()));
         }
-        offset += expr->type.size;
+        offset += expr->type.GetSize();
       }
     }
   }
@@ -2233,7 +2318,7 @@ AllocaInst *CodegenLLVM::getHistMapKey(Map &map, Value *log2)
     size_t size = 8; // Extra space for the bucket value
     for (Expression *expr : *map.vargs)
     {
-      size += expr->type.size;
+      size += expr->type.GetSize();
     }
     key = b_.CreateAllocaBPF(size, map.ident + "_key");
 
@@ -2242,10 +2327,10 @@ AllocaInst *CodegenLLVM::getHistMapKey(Map &map, Value *log2)
       auto scoped_del = accept(expr);
       Value *offset_val = b_.CreateGEP(key, {b_.getInt64(0), b_.getInt64(offset)});
       if (shouldBeOnStackAlready(expr->type))
-        b_.CREATE_MEMCPY(offset_val, expr_, expr->type.size, 1);
+        b_.CREATE_MEMCPY(offset_val, expr_, expr->type.GetSize(), 1);
       else
         b_.CreateStore(expr_, offset_val);
-      offset += expr->type.size;
+      offset += expr->type.GetSize();
     }
     Value *offset_val = b_.CreateGEP(key, {b_.getInt64(0), b_.getInt64(offset)});
     b_.CreateStore(log2, offset_val);
@@ -2539,7 +2624,11 @@ void CodegenLLVM::createFormatStringCall(Call &call, int &id, CallArgs &call_arg
     auto scoped_del = accept(&arg);
     Value *offset = b_.CreateGEP(fmt_args, {b_.getInt32(0), b_.getInt32(i)});
     if (needMemcpy(arg.type))
-      b_.CREATE_MEMCPY(offset, expr_, arg.type.size, 1);
+      b_.CREATE_MEMCPY(offset, expr_, arg.type.GetSize(), 1);
+    else if (arg.type.IsIntegerTy() && arg.type.GetSize() < 8)
+      b_.CreateStore(
+          b_.CreateIntCast(expr_, b_.getInt64Ty(), arg.type.IsSigned()),
+          offset);
     else
       b_.CreateStore(expr_, offset);
   }
@@ -2599,9 +2688,9 @@ void CodegenLLVM::createPrintNonMapCall(Call &call, int &id)
   auto &arg = *call.vargs->at(0);
   auto scoped_del = accept(&arg);
 
-  auto elements = AsyncEvent::PrintNonMap().asLLVMType(b_, arg.type.size);
+  auto elements = AsyncEvent::PrintNonMap().asLLVMType(b_, arg.type.GetSize());
   std::ostringstream struct_name;
-  struct_name << call.func << "_" << arg.type.type << "_" << arg.type.size
+  struct_name << call.func << "_" << arg.type.type << "_" << arg.type.GetSize()
               << "_t";
   StructType *print_struct = b_.GetStructType(struct_name.str(),
                                               elements,
@@ -2619,9 +2708,9 @@ void CodegenLLVM::createPrintNonMapCall(Call &call, int &id)
 
   // Store content
   Value *content_offset = b_.CreateGEP(buf, { b_.getInt32(0), b_.getInt32(2) });
-  b_.CREATE_MEMSET(content_offset, b_.getInt8(0), arg.type.size, 1);
+  b_.CREATE_MEMSET(content_offset, b_.getInt8(0), arg.type.GetSize(), 1);
   if (needMemcpy(arg.type))
-    b_.CREATE_MEMCPY(content_offset, expr_, arg.type.size, 1);
+    b_.CREATE_MEMCPY(content_offset, expr_, arg.type.GetSize(), 1);
   else
   {
     auto ptr = b_.CreatePointerCast(content_offset,

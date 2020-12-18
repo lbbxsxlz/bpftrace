@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <glob.h>
+#include <limits>
 #include <link.h>
 #include <map>
 #include <memory>
@@ -806,6 +807,9 @@ uint64_t parse_exponent(const char *str)
 
   auto exp = strtoll(e_offset + 1, nullptr, 10);
   auto num = base * std::pow(10, exp);
+  uint64_t max = std::numeric_limits<uint64_t>::max();
+  if (num > (double)max)
+    throw std::runtime_error(std::string(str) + " is too big for uint64_t");
   return num;
 }
 
@@ -924,8 +928,19 @@ uint32_t kernel_version(int attempt)
 
 std::string abs_path(const std::string &rel_path)
 {
-  auto p = std_filesystem::path(rel_path);
-  return std_filesystem::canonical(std_filesystem::absolute(p)).string();
+  // filesystem::canonical does not work very well with /proc/<pid>/root paths
+  // of processes in a different mount namespace (than the one bpftrace is
+  // running in), failing during canonicalization. See iovisor:bpftrace#1595
+  static auto re = std::regex("^/proc/\\d+/root/.*");
+  if (!std::regex_match(rel_path, re))
+  {
+    auto p = std_filesystem::path(rel_path);
+    return std_filesystem::canonical(std_filesystem::absolute(p)).string();
+  }
+  else
+  {
+    return rel_path;
+  }
 }
 
 } // namespace bpftrace
